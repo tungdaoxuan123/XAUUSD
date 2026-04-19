@@ -28,16 +28,14 @@ class Settings:
         # Format: {"start": "2024-04-10 12:28", "end": "2024-04-10 12:32"}
     ]
     
-    # Thresholds (long-only)
+    # Thresholds
     BUY_THRESHOLD = 0.5
+    SELL_THRESHOLD = 0.5
     BUY_CONFIDENCE = 0.65
+    SELL_CONFIDENCE = 0.7
     
     # Paths
     ENSEMBLE_MODEL_PATH = os.getenv("ENSEMBLE_MODEL_PATH", "train_pipeline/models_dukas_300b/")
-    # SOTA Model
-    SOTA_MODEL_PATH = os.getenv("SOTA_MODEL_PATH", "train_pipeline/models_sota/patchtst_primary.pt")
-    SOTA_CONFIG_PATH = os.getenv("SOTA_CONFIG_PATH", "train_pipeline/models_sota/sota_config.json")
-    SOTA_DEVICE = "cpu"  # DirectML doesn't support TransformerEncoderLayer logic accurately
     LOG_FILE = "ftmo_trading.log"
 
 def setup_logging():

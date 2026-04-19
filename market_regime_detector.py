@@ -24,128 +24,66 @@ class MarketRegime(Enum):
 class RegimeParameters:
     """Trading parameters optimized for each market regime"""
 
-    def __init__(self, scalping_mode: bool = False):
-        self.scalping_mode = scalping_mode
+    def __init__(self):
         # Base parameters for each regime
-        if not scalping_mode:
-            self.regime_params = {
-                MarketRegime.STRONG_BULL: {
-                    'profit_targets': [0.015, 0.03, 0.06, 0.12],  # Higher targets in strong trends
-                    'trailing_stop_pct': 0.03,  # Tighter stops to capture momentum
-                    'position_size_multiplier': 1.5,  # Larger positions in strong trends
-                    'max_holding_time': 48,  # Longer holding in trends
-                    'breakeven_trigger': 0.02,  # Later breakeven
-                    'min_confidence_threshold': 0.25,  # Lower threshold for strong trends
-                },
-                MarketRegime.BULL_TREND: {
-                    'profit_targets': [0.012, 0.025, 0.05, 0.10],
-                    'trailing_stop_pct': 0.025,
-                    'position_size_multiplier': 1.2,
-                    'max_holding_time': 36,
-                    'breakeven_trigger': 0.018,
-                    'min_confidence_threshold': 0.3,
-                },
-                MarketRegime.BEAR_TREND: {
-                    'profit_targets': [0.012, 0.025, 0.05, 0.10],
-                    'trailing_stop_pct': 0.025,
-                    'position_size_multiplier': 1.2,
-                    'max_holding_time': 36,
-                    'breakeven_trigger': 0.018,
-                    'min_confidence_threshold': 0.3,
-                },
-                MarketRegime.STRONG_BEAR: {
-                    'profit_targets': [0.015, 0.03, 0.06, 0.12],
-                    'trailing_stop_pct': 0.03,
-                    'position_size_multiplier': 1.5,
-                    'max_holding_time': 48,
-                    'breakeven_trigger': 0.02,
-                    'min_confidence_threshold': 0.25,
-                },
-                MarketRegime.RANGING: {
-                    'profit_targets': [0.008, 0.015, 0.03, 0.06],  # Lower targets in ranging markets
-                    'trailing_stop_pct': 0.02,  # Tighter stops to protect against whipsaws
-                    'position_size_multiplier': 0.7,  # Smaller positions in ranging markets
-                    'max_holding_time': 12,  # Shorter holding periods
-                    'breakeven_trigger': 0.012,  # Earlier breakeven
-                    'min_confidence_threshold': 0.4,  # Higher threshold for ranging markets
-                },
-                MarketRegime.HIGH_VOLATILITY: {
-                    'profit_targets': [0.02, 0.04, 0.08, 0.15],  # Higher targets for volatility
-                    'trailing_stop_pct': 0.04,  # Wider stops for volatility
-                    'position_size_multiplier': 0.6,  # Smaller positions in high volatility
-                    'max_holding_time': 8,  # Very short holding periods
-                    'breakeven_trigger': 0.025,  # Later breakeven for volatility
-                    'min_confidence_threshold': 0.5,  # Much higher threshold
-                },
-                MarketRegime.LOW_VOLATILITY: {
-                    'profit_targets': [0.005, 0.01, 0.02, 0.04],  # Lower targets in low volatility
-                    'trailing_stop_pct': 0.015,  # Tighter stops
-                    'position_size_multiplier': 1.0,  # Normal positions
-                    'max_holding_time': 24,  # Normal holding periods
-                    'breakeven_trigger': 0.008,  # Earlier breakeven
-                    'min_confidence_threshold': 0.35,  # Moderate threshold
-                }
+        self.regime_params = {
+            MarketRegime.STRONG_BULL: {
+                'profit_targets': [0.015, 0.03, 0.06, 0.12],  # Higher targets in strong trends
+                'trailing_stop_pct': 0.03,  # Tighter stops to capture momentum
+                'position_size_multiplier': 1.5,  # Larger positions in strong trends
+                'max_holding_time': 48,  # Longer holding in trends
+                'breakeven_trigger': 0.02,  # Later breakeven
+                'min_confidence_threshold': 0.25,  # Lower threshold for strong trends
+            },
+            MarketRegime.BULL_TREND: {
+                'profit_targets': [0.012, 0.025, 0.05, 0.10],
+                'trailing_stop_pct': 0.025,
+                'position_size_multiplier': 1.2,
+                'max_holding_time': 36,
+                'breakeven_trigger': 0.018,
+                'min_confidence_threshold': 0.3,
+            },
+            MarketRegime.BEAR_TREND: {
+                'profit_targets': [0.012, 0.025, 0.05, 0.10],
+                'trailing_stop_pct': 0.025,
+                'position_size_multiplier': 1.2,
+                'max_holding_time': 36,
+                'breakeven_trigger': 0.018,
+                'min_confidence_threshold': 0.3,
+            },
+            MarketRegime.STRONG_BEAR: {
+                'profit_targets': [0.015, 0.03, 0.06, 0.12],
+                'trailing_stop_pct': 0.03,
+                'position_size_multiplier': 1.5,
+                'max_holding_time': 48,
+                'breakeven_trigger': 0.02,
+                'min_confidence_threshold': 0.25,
+            },
+            MarketRegime.RANGING: {
+                'profit_targets': [0.008, 0.015, 0.03, 0.06],  # Lower targets in ranging markets
+                'trailing_stop_pct': 0.02,  # Tighter stops to protect against whipsaws
+                'position_size_multiplier': 0.7,  # Smaller positions in ranging markets
+                'max_holding_time': 12,  # Shorter holding periods
+                'breakeven_trigger': 0.012,  # Earlier breakeven
+                'min_confidence_threshold': 0.4,  # Higher threshold for ranging markets
+            },
+            MarketRegime.HIGH_VOLATILITY: {
+                'profit_targets': [0.02, 0.04, 0.08, 0.15],  # Higher targets for volatility
+                'trailing_stop_pct': 0.04,  # Wider stops for volatility
+                'position_size_multiplier': 0.6,  # Smaller positions in high volatility
+                'max_holding_time': 8,  # Very short holding periods
+                'breakeven_trigger': 0.025,  # Later breakeven for volatility
+                'min_confidence_threshold': 0.5,  # Much higher threshold
+            },
+            MarketRegime.LOW_VOLATILITY: {
+                'profit_targets': [0.005, 0.01, 0.02, 0.04],  # Lower targets in low volatility
+                'trailing_stop_pct': 0.015,  # Tighter stops
+                'position_size_multiplier': 1.0,  # Normal positions
+                'max_holding_time': 24,  # Normal holding periods
+                'breakeven_trigger': 0.008,  # Earlier breakeven
+                'min_confidence_threshold': 0.35,  # Moderate threshold
             }
-        else:
-            # SCALPING MODE: Much tighter targets for 5-6 trades an hour
-            self.regime_params = {
-                MarketRegime.STRONG_BULL: {
-                    'profit_targets': [0.002, 0.004, 0.008, 0.015],
-                    'trailing_stop_pct': 0.003,
-                    'position_size_multiplier': 1.2,
-                    'max_holding_time': 20, # minutes
-                    'breakeven_trigger': 0.003,
-                    'min_confidence_threshold': 0.2,
-                },
-                MarketRegime.BULL_TREND: {
-                    'profit_targets': [0.0015, 0.003, 0.006, 0.012],
-                    'trailing_stop_pct': 0.0025,
-                    'position_size_multiplier': 1.0,
-                    'max_holding_time': 15,
-                    'breakeven_trigger': 0.0025,
-                    'min_confidence_threshold': 0.25,
-                },
-                MarketRegime.BEAR_TREND: {
-                    'profit_targets': [0.0015, 0.003, 0.006, 0.012],
-                    'trailing_stop_pct': 0.0025,
-                    'position_size_multiplier': 1.0,
-                    'max_holding_time': 15,
-                    'breakeven_trigger': 0.0025,
-                    'min_confidence_threshold': 0.25,
-                },
-                MarketRegime.STRONG_BEAR: {
-                    'profit_targets': [0.002, 0.004, 0.008, 0.015],
-                    'trailing_stop_pct': 0.003,
-                    'position_size_multiplier': 1.2,
-                    'max_holding_time': 20,
-                    'breakeven_trigger': 0.003,
-                    'min_confidence_threshold': 0.2,
-                },
-                MarketRegime.RANGING: {
-                    'profit_targets': [0.001, 0.002, 0.004, 0.008],
-                    'trailing_stop_pct': 0.002,
-                    'position_size_multiplier': 0.8,
-                    'max_holding_time': 10,
-                    'breakeven_trigger': 0.002,
-                    'min_confidence_threshold': 0.35,
-                },
-                MarketRegime.HIGH_VOLATILITY: {
-                    'profit_targets': [0.003, 0.006, 0.012, 0.02],
-                    'trailing_stop_pct': 0.005,
-                    'position_size_multiplier': 0.6,
-                    'max_holding_time': 8,
-                    'breakeven_trigger': 0.004,
-                    'min_confidence_threshold': 0.45,
-                },
-                MarketRegime.LOW_VOLATILITY: {
-                    'profit_targets': [0.0005, 0.001, 0.002, 0.004],
-                    'trailing_stop_pct': 0.0015,
-                    'position_size_multiplier': 1.0,
-                    'max_holding_time': 12,
-                    'breakeven_trigger': 0.0015,
-                    'min_confidence_threshold': 0.3,
-                }
-            }
+        }
 
     def get_parameters(self, regime: MarketRegime) -> Dict:
         """Get trading parameters for a specific regime"""
@@ -156,10 +94,10 @@ class MarketRegimeDetector:
     Advanced market regime detection using multiple indicators
     """
 
-    def __init__(self, lookback_periods: List[int] = [20, 50, 100], scalping_mode: bool = False):
+    def __init__(self, lookback_periods: List[int] = [20, 50, 100]):
         self.lookback_periods = lookback_periods
         self.regime_history = []
-        self.parameters = RegimeParameters(scalping_mode=scalping_mode)
+        self.parameters = RegimeParameters()
 
     def detect_regime(self, price_data: pd.DataFrame, current_idx: int = -1) -> Tuple[MarketRegime, Dict]:
         """

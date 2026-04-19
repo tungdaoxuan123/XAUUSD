@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-ensemble_gpu.py - Live Inference Wrapper for GPU-trained LONG-ONLY Binary Ensemble
+ensemble_gpu.py - Live Inference Wrapper for GPU-trained LightGBM Ensemble
 
 Loads three LightGBM models (or sklearn fallbacks) trained by train_ensemble_gpu.py
-and combines them via soft voting (averaged predict_proba) to produce a
-(long_action, long_confidence) output.
+and combines them via soft voting (averaged predict_proba) to produce an
+(action, confidence) output identical to EnsembleTrader.predict_ensemble().
 
 This wrapper auto-detects whether saved models are LightGBM (.txt) or
 sklearn (.joblib) based on the ensemble_metadata.json.
@@ -15,7 +15,7 @@ Usage in live_ensemble_trading.py:
     # In __init__:
     self.gpu_signal = EnsembleGPU.load("train_pipeline/models_gpu")
 
-    # In run_live_trading:
+    # In run_live_trading (as confluence filter):
     obs_df = build_obs_from_rates(rates, expanded=False)
     gp_action, gp_confidence = self.gpu_signal.predict(obs_df)
 """
@@ -36,14 +36,16 @@ def get_feature_names(lookback: int, expanded: bool = False, micro: bool = False
     common = base + ["RSI", "MACD", "Signal_Line", "current_position", "current_balance"]
     if expanded:
         common += ["MACD_Hist", "VWAP", "close_minus_vwap", "ATR", "BB_width"]
-        common += ["atr_ratio", "adx_14", "is_london", "is_ny", "is_overlap",
-                   "hour_sin", "hour_cos", "dow"]
     if micro:
         common += [
             "tick_imbalance", "bid_ask_vol_imbalance", "spread_mean", "ofi_window", "of_pressure_flag",
             "vprof_poc_dist", "vprof_in_value_area", "vprof_hvn_flag", "vprof_lvn_flag"
         ]
     return common
+
+
+# Label mapping (-1=SELL, 0=HOLD, 1=BUY -> lgbm classes 0,1,2)
+LABEL_UNMAP = {0: -1, 1: 0, 2: 1}
 
 
 # ---------------------------------------------------------------------------
@@ -88,42 +90,13 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["close_minus_vwap"] = close - df["VWAP"]
 
     df = df.replace([np.inf, -np.inf], np.nan)
+    # Only drop rows where the indicators we just computed are NaN
     indicator_cols = ["RSI", "MACD", "Signal_Line", "ATR", "BB_width", "VWAP"]
     df = df.dropna(subset=[c for c in indicator_cols if c in df.columns]).reset_index(drop=True)
-
-    # Regime / session features
-    atr_100 = pd.concat([df["high"] - df["low"],
-                         (df["high"] - df["close"].shift()).abs(),
-                         (df["low"] - df["close"].shift()).abs()], axis=1).max(axis=1).rolling(100).mean()
-    df["atr_ratio"] = (df["ATR"] / (atr_100 + 1e-9)).clip(0, 10)
-
-    tr = pd.concat([df["high"] - df["low"],
-                    (df["high"] - df["close"].shift()).abs(),
-                    (df["low"] - df["close"].shift()).abs()], axis=1).max(axis=1)
-    plus_dm = (df["high"] - df["high"].shift()).clip(lower=0)
-    minus_dm = (df["low"].shift() - df["low"]).clip(lower=0)
-    atr_14 = tr.rolling(14).mean()
-    plus_di = 100 * (plus_dm.rolling(14).mean() / (atr_14 + 1e-9))
-    minus_di = 100 * (minus_dm.rolling(14).mean() / (atr_14 + 1e-9))
-    dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9))
-    df["adx_14"] = dx.rolling(14).mean().fillna(0)
-
-    if "time" in df.columns:
-        dt_idx = pd.to_datetime(df["time"])
-        hour = dt_idx.dt.hour
-    else:
-        hour = pd.Series(0, index=df.index)
-    df["is_london"]  = ((hour >= 7)  & (hour < 16)).astype(int)
-    df["is_ny"]      = ((hour >= 13) & (hour < 21)).astype(int)
-    df["is_overlap"] = ((hour >= 13) & (hour < 16)).astype(int)
-    df["hour_sin"]   = np.sin(2 * np.pi * hour / 24)
-    df["hour_cos"]   = np.cos(2 * np.pi * hour / 24)
-    df["dow"]        = pd.to_datetime(df["time"]).dt.dayofweek if "time" in df.columns else 0
-
     return df
 
 
-def build_obs_from_rates(rates, lookback: int = 60, expanded: bool = False, micro: bool = False, current_pos=0.0, balance=10000.0):
+def build_obs_from_rates(rates, lookback: int = 10, expanded: bool = False, micro: bool = False, current_pos=0.0, balance=10000.0):
     """Convert MT5 rate array -> single-row observation DataFrame with dynamic lookback."""
     df = pd.DataFrame(rates)
     if "time" in df.columns:
@@ -152,14 +125,6 @@ def build_obs_from_rates(rates, lookback: int = 60, expanded: bool = False, micr
             float(latest["close_minus_vwap"]), 
             float(latest["ATR"]), 
             float(latest["BB_width"]),
-            float(latest.get("atr_ratio", 0)),
-            float(latest.get("adx_14", 0)),
-            int(latest.get("is_london", 0)),
-            int(latest.get("is_ny", 0)),
-            int(latest.get("is_overlap", 0)),
-            float(latest.get("hour_sin", 0)),
-            float(latest.get("hour_cos", 0)),
-            int(latest.get("dow", 0)),
         ]
         
     if micro:
@@ -176,19 +141,21 @@ def build_obs_from_rates(rates, lookback: int = 60, expanded: bool = False, micr
 # ---------------------------------------------------------------------------
 
 class _LGBMWrapper:
-    """Wraps a raw LightGBM Booster to mimic sklearn predict_proba interface (binary)."""
+    """Wraps a raw LightGBM Booster to mimic sklearn predict_proba interface."""
 
-    def __init__(self, booster):
+    def __init__(self, booster, n_classes=3):
         self.booster = booster
-        self.classes_ = np.array([0, 1])
+        self.n_classes = n_classes
+        # classes_ is always [0, 1, 2] in LightGBM multiclass
+        self.classes_ = np.array([0, 1, 2])
 
     def predict_proba(self, X) -> np.ndarray:
+        # X can be pd.DataFrame or np.ndarray from live bot
         x_values = X.values if hasattr(X, "values") else X
-        proba = self.booster.predict(x_values)  # shape (n_samples,) for binary
-        if proba.ndim == 0:
-            proba = np.array([proba])
-        # Return as (n, 2) array: [p_wait, p_long]
-        return np.stack([1.0 - proba, proba], axis=1)
+        proba = self.booster.predict(x_values)  # shape (n_samples, 3)
+        if proba.ndim == 1:
+            proba = proba.reshape(1, -1)
+        return proba
 
 
 # ---------------------------------------------------------------------------
@@ -197,28 +164,42 @@ class _LGBMWrapper:
 
 class EnsembleGPU:
     """
-    Soft-voting ensemble over three LightGBM or sklearn models (binary).
+    Soft-voting ensemble over three LightGBM or sklearn models.
 
-    Output:
-        action     : 1.0 (LONG) | 0.0 (WAIT)
-        confidence : averaged long probability (0.0-1.0)
+    Output interface matches EnsembleTrader.predict_ensemble():
+        action     : +0.5 (BUY) | -0.5 (SELL) | 0.0 (HOLD)
+        confidence : highest averaged class probability
     """
 
     def __init__(self, models: dict, metadata: dict):
+        """
+        Args:
+            models:   dict {role: model_object} where model has predict_proba(X)
+            metadata: contents of ensemble_metadata.json
+        """
         self.models = models
         self.metadata = metadata
         self.expanded = metadata.get("expanded_features", False)
-        self.lookback = metadata.get("lookback", 60)
+        self.lookback = metadata.get("lookback", 10)
         self.backend = metadata.get("backend", "unknown")
         self.gpu_used = metadata.get("gpu_used", False)
         self.micro = metadata.get("microstructure_features", False) or metadata.get("micro", False)
         
         self.label_horizon = metadata.get("label_horizon")
-        self.long_threshold = metadata.get("long_threshold", 0.0005)
-        self.long_confidence = metadata.get("long_confidence", self.long_threshold)
+        self.buy_threshold = metadata.get("buy_threshold")
+        self.sell_threshold = metadata.get("sell_threshold")
 
     @classmethod
     def load(cls, model_dir: str) -> "EnsembleGPU":
+        """
+        Load all models from model_dir using ensemble_metadata.json.
+
+        Args:
+            model_dir: directory containing ensemble_metadata.json + model files
+
+        Example:
+            ens = EnsembleGPU.load("train_pipeline/models_gpu")
+        """
         meta_path = os.path.join(model_dir, "ensemble_metadata.json")
         if not os.path.exists(meta_path):
             raise FileNotFoundError(
@@ -238,6 +219,7 @@ class EnsembleGPU:
                 raise FileNotFoundError(f"Model file not found: {model_path}")
 
             if model_path.endswith(".txt"):
+                # LightGBM text model
                 try:
                     import lightgbm as lgb
                     booster = lgb.Booster(model_file=model_path)
@@ -247,6 +229,7 @@ class EnsembleGPU:
                     raise ImportError("LightGBM not installed. Run: pip install lightgbm")
 
             elif model_path.endswith(".joblib"):
+                # sklearn Pipeline fallback
                 import joblib
                 models[role] = joblib.load(model_path)
                 logger.info(f"EnsembleGPU: loaded sklearn [{role}] from {model_path}")
@@ -260,25 +243,38 @@ class EnsembleGPU:
         )
         return cls(models, metadata)
 
-    def _get_probs(self, model, obs_df: pd.DataFrame) -> float:
-        """Extract long-entry probability from a model (binary)."""
+    def _get_probs(self, model, obs_df: pd.DataFrame) -> dict:
+        """
+        Extract buy/hold/sell probabilities from a model.
+        Handles both LightGBM (classes_ = [0,1,2] = SELL,HOLD,BUY)
+        and sklearn (classes_ can be a subset of [-1,0,1]).
+        """
         try:
             proba = model.predict_proba(obs_df)[0]
             classes = model.classes_
 
-            if hasattr(model, "booster") or list(classes) == [0, 1]:
-                # Binary: proba = [p_wait, p_long]
-                return float(proba[1])
+            prob_map = {"buy": 0.0, "hold": 0.0, "sell": 0.0}
+
+            # LightGBM path: classes are LightGBM-encoded (0=SELL,1=HOLD,2=BUY)
+            if hasattr(model, "booster"):
+                prob_map["sell"] = float(proba[0])
+                prob_map["hold"] = float(proba[1])
+                prob_map["buy"]  = float(proba[2])
             else:
-                # sklearn with custom classes
+                # sklearn path: classes_ are original labels (-1, 0, 1)
                 for cls, p in zip(classes, proba):
                     if cls == 1:
-                        return float(p)
-                return float(proba[-1])  # last column is assumed class 1
+                        prob_map["buy"] = float(p)
+                    elif cls == 0:
+                        prob_map["hold"] = float(p)
+                    elif cls == -1:
+                        prob_map["sell"] = float(p)
+
+            return prob_map
 
         except Exception as e:
             logger.warning(f"EnsembleGPU predict failed: {e}")
-            return 0.0
+            return {"buy": 0.0, "hold": 1.0, "sell": 0.0}
 
     def predict(self, obs_df) -> tuple:
         """
@@ -286,28 +282,36 @@ class EnsembleGPU:
 
         Returns:
             (action, confidence):
-                action     = 1.0 (LONG) | 0.0 (WAIT)
-                confidence = averaged long probability (0.0-1.0)
+                action     = +0.5 (BUY) | -0.5 (SELL) | 0.0 (HOLD)
+                confidence = highest averaged class probability (0.0-1.0)
         """
         if obs_df is None or (hasattr(obs_df, "empty") and obs_df.empty) or (not hasattr(obs_df, "empty") and len(obs_df) == 0):
             return 0.0, 0.0
 
-        all_long = []
+        all_buy, all_hold, all_sell = [], [], []
+
         for role, model in self.models.items():
-            all_long.append(self._get_probs(model, obs_df))
+            probs = self._get_probs(model, obs_df)
+            all_buy.append(probs["buy"])
+            all_hold.append(probs["hold"])
+            all_sell.append(probs["sell"])
 
-        avg_long = float(np.mean(all_long))
-        confidence = avg_long
+        avg_buy  = float(np.mean(all_buy))
+        avg_hold = float(np.mean(all_hold))
+        avg_sell = float(np.mean(all_sell))
+        confidence = max(avg_buy, avg_hold, avg_sell)
 
-        if avg_long > 0.5:
-            return 1.0, confidence
+        if avg_buy > avg_sell and avg_buy > avg_hold:
+            return 0.5, confidence
+        elif avg_sell > avg_buy and avg_sell > avg_hold:
+            return -0.5, confidence
         else:
-            return 0.0, 1.0 - confidence
+            return 0.0, confidence
 
     def predict_batch(self, X: pd.DataFrame) -> tuple:
         """
-        Vectorized soft-voting across all loaded models.
-
+        Vectorized soft-voting across all loaded models. Useful for backtesting.
+        
         Returns:
             (actions, confidences): numpy arrays of shape (len(X),)
         """
@@ -315,44 +319,65 @@ class EnsembleGPU:
             return np.array([]), np.array([])
 
         n_samples = len(X)
-        sum_long = np.zeros(n_samples)
+        sum_buy  = np.zeros(n_samples)
+        sum_hold = np.zeros(n_samples)
+        sum_sell = np.zeros(n_samples)
 
         for role, model in self.models.items():
+            # Get vectorized probabilities (n_samples, 3)
             proba_arr = model.predict_proba(X)
-            # proba_arr shape (n, 2): [p_wait, p_long]
+            
+            # Identify which index is which class
             if hasattr(model, "booster"):
-                sum_long += proba_arr[:, 1]
+                # LightGBM: 0=SELL, 1=HOLD, 2=BUY
+                sum_sell += proba_arr[:, 0]
+                sum_hold += proba_arr[:, 1]
+                sum_buy  += proba_arr[:, 2]
             else:
+                # sklearn: classes_ are labels (-1, 0, 1)
                 for idx, cls in enumerate(model.classes_):
                     if cls == 1:
-                        sum_long += proba_arr[:, idx]
-                        break
-                else:
-                    sum_long += proba_arr[:, -1]
+                        sum_buy += proba_arr[:, idx]
+                    elif cls == 0:
+                        sum_hold += proba_arr[:, idx]
+                    elif cls == -1:
+                        sum_sell += proba_arr[:, idx]
 
         n_models = len(self.models)
-        avg_long = sum_long / n_models
-        confidence = avg_long
-
-        actions = np.where(avg_long > 0.5, 1.0, 0.0)
-
+        avg_buy  = sum_buy / n_models
+        avg_hold = sum_hold / n_models
+        avg_sell = sum_sell / n_models
+        
+        # Stack to find max across classes
+        stacked = np.stack([avg_sell, avg_hold, avg_buy], axis=1) # (N, 3)
+        confidence = np.max(stacked, axis=1)
+        winning_class = np.argmax(stacked, axis=1) # 0=SELL, 1=HOLD, 2=BUY
+        
+        actions = np.zeros(n_samples)
+        actions[winning_class == 0] = -0.5
+        actions[winning_class == 2] = 0.5
+        
+        # If HOLD is winner, action is already 0.0
         return actions, confidence
 
     def predict_detail(self, obs_df) -> dict:
-        """Returns per-model long probability breakdown. Useful for dry-run debugging."""
+        """Returns per-model probability breakdown. Useful for dry-run debugging."""
         if obs_df is None or obs_df.empty:
             return {}
 
-        all_long = []
+        all_buy, all_hold, all_sell = [], [], []
         detail = {}
 
         for role, model in self.models.items():
-            p_long = self._get_probs(model, obs_df)
-            detail[role] = {"long": p_long, "wait": 1.0 - p_long}
-            all_long.append(p_long)
+            probs = self._get_probs(model, obs_df)
+            detail[role] = probs
+            all_buy.append(probs["buy"])
+            all_hold.append(probs["hold"])
+            all_sell.append(probs["sell"])
 
         detail["avg"] = {
-            "long": float(np.mean(all_long)),
-            "wait": 1.0 - float(np.mean(all_long)),
+            "buy": float(np.mean(all_buy)),
+            "hold": float(np.mean(all_hold)),
+            "sell": float(np.mean(all_sell)),
         }
         return detail

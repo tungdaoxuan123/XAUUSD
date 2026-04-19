@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-ensemble_sklearn.py - 3-Model LONG-ONLY Binary Soft-Voting Inference Wrapper
+ensemble_sklearn.py - 3-Model Soft-Voting Inference Wrapper
 
 Loads the three trained sklearn pipelines (trend / structure / regime) and
-combines them via soft voting (averaged predict_proba) for binary long/wait.
+combines them via soft voting (averaged predict_proba) to produce the same
+(action, confidence) output interface as EnsembleTrader.predict_ensemble().
 
 Usage in live_ensemble_trading.py:
     from train_pipeline.ensemble_sklearn import SklearnEnsemble, build_obs_from_rates
@@ -11,10 +12,10 @@ Usage in live_ensemble_trading.py:
     # In __init__:
     self.sklearn_signal = SklearnEnsemble.load_all("train_pipeline/models", "default")
 
-    # In run_live_trading:
+    # In run_live_trading (as a second confirmation layer):
     obs_df = build_obs_from_rates(rates, expanded=False)
     sk_action, sk_confidence = self.sklearn_signal.predict(obs_df)
-    # sk_action: 1.0 (long), 0.0 (wait)
+    # sk_action: +0.5 (buy), -0.5 (sell), 0.0 (hold)
     # sk_confidence: 0.0 - 1.0
 """
 
@@ -143,11 +144,15 @@ def build_obs_from_rates(rates, expanded: bool = False) -> "pd.DataFrame | None"
 
 class SklearnEnsemble:
     """
-    Combines three sklearn pipelines via soft voting for binary long/wait.
+    Combines three sklearn pipelines via soft voting (averaged predict_proba).
 
-    Output:
-        action     : 1.0 (LONG) | 0.0 (WAIT)
-        confidence : averaged long probability (0.0 - 1.0)
+    Soft voting is preferred over hard voting because it uses class probability
+    estimates rather than just final labels, giving a more informative combined
+    decision when base models can produce probabilities.
+
+    Output interface matches EnsembleTrader.predict_ensemble():
+        action     : +0.5 (BUY) | -0.5 (SELL) | 0.0 (HOLD)
+        confidence : highest averaged class probability (0.0 - 1.0)
     """
 
     def __init__(self, pipelines: dict, expanded: bool = False):
@@ -187,55 +192,87 @@ class SklearnEnsemble:
         return cls(pipelines, expanded)
 
     def _get_class_probs(self, pipeline, obs_df: pd.DataFrame) -> dict:
-        proba = pipeline.predict_proba(obs_df)[0]
-        classes = pipeline.classes_
+        """
+        Extract per-class probabilities safely using pipeline.classes_.
 
-        prob_map = {"long": 0.0, "wait": 0.0}
+        sklearn's predict_proba columns are ordered by classes_, NOT by [-1, 0, 1].
+        We must map explicitly to avoid silent probability column misalignment.
+        """
+        proba = pipeline.predict_proba(obs_df)[0]  # shape (n_classes,)
+        classes = pipeline.classes_                 # e.g. [-1, 0, 1] or subset
+
+        prob_map = {"buy": 0.0, "hold": 0.0, "sell": 0.0}
         for cls, p in zip(classes, proba):
             if cls == 1:
-                prob_map["long"] = p
+                prob_map["buy"] = p
             elif cls == 0:
-                prob_map["wait"] = p
+                prob_map["hold"] = p
+            elif cls == -1:
+                prob_map["sell"] = p
 
         return prob_map
 
     def predict(self, obs_df: "pd.DataFrame | None") -> tuple:
+        """
+        Soft-voting prediction across all loaded models.
+
+        Returns:
+            (action, confidence) where:
+                action     = +0.5 (BUY) | -0.5 (SELL) | 0.0 (HOLD)
+                confidence = highest averaged class probability
+        """
         if obs_df is None or obs_df.empty:
             return 0.0, 0.0
 
-        all_long = []
+        all_buy, all_hold, all_sell = [], [], []
 
         for key, pipeline in self.pipelines.items():
             try:
                 probs = self._get_class_probs(pipeline, obs_df)
-                all_long.append(probs["long"])
+                all_buy.append(probs["buy"])
+                all_hold.append(probs["hold"])
+                all_sell.append(probs["sell"])
             except Exception as e:
                 logger.warning(f"SklearnEnsemble [{key}] predict_proba failed: {e}")
-                all_long.append(0.0)
+                all_buy.append(0.0)
+                all_hold.append(1.0)
+                all_sell.append(0.0)
 
-        avg_long = float(np.mean(all_long))
-        confidence = avg_long
+        avg_buy = float(np.mean(all_buy))
+        avg_hold = float(np.mean(all_hold))
+        avg_sell = float(np.mean(all_sell))
 
-        if avg_long > 0.5:
-            return 1.0, confidence
+        confidence = max(avg_buy, avg_hold, avg_sell)
+
+        if avg_buy > avg_sell and avg_buy > avg_hold:
+            return 0.5, confidence
+        elif avg_sell > avg_buy and avg_sell > avg_hold:
+            return -0.5, confidence
         else:
-            return 0.0, 1.0 - confidence
+            return 0.0, confidence
 
     def predict_detail(self, obs_df: "pd.DataFrame | None") -> dict:
+        """
+        Returns full per-model and averaged probability breakdown for inspection.
+        Useful for debugging in dry-run mode.
+        """
         if obs_df is None or obs_df.empty:
             return {}
 
         detail = {}
-        all_long = []
+        all_buy, all_hold, all_sell = [], [], []
 
         for key, pipeline in self.pipelines.items():
             probs = self._get_class_probs(pipeline, obs_df)
             detail[key] = probs
-            all_long.append(probs["long"])
+            all_buy.append(probs["buy"])
+            all_hold.append(probs["hold"])
+            all_sell.append(probs["sell"])
 
         detail["avg"] = {
-            "long": float(np.mean(all_long)),
-            "wait": 1.0 - float(np.mean(all_long)),
+            "buy": float(np.mean(all_buy)),
+            "hold": float(np.mean(all_hold)),
+            "sell": float(np.mean(all_sell)),
         }
 
         return detail
