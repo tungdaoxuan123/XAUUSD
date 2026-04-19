@@ -1,0 +1,14 @@
+# GPU Requirements - XAUUSD 3-Model Ensemble (AMD RX 6700 XT)
+
+# Core ML
+lightgbm>=4.3.0
+scikit-learn>=1.3.0
+joblib>=1.3.0
+pandas>=2.0.0
+numpy>=1.26.0
+
+# Optional: XGBoost (for ROCm/AMD GPU path)
+# xgboost>=2.0.0
+
+# MT5 data fetching
+MetaTrader5>=5.0.45
