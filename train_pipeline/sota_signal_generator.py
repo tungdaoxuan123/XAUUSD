@@ -431,10 +431,12 @@ def predict_combined(
     device: str = "cpu",
 ) -> pd.DataFrame:
     """Return DataFrame with 'primary_pred', 'meta_score', 'final_signal'."""
-    if not HAS_TORCH:
-        raise RuntimeError("torch required for inference with PatchTST-lite.")
-
+    ckpt = torch.load(primary_path, map_location=device)
+    
     feats = _select_available(df, FEATURE_COLS)
+    if len(feats) != ckpt["n_features"]:
+        logger.warning(f"Feature count mismatch! Model expects {ckpt['n_features']} but found {len(feats)}. Check if indicators were added.")
+
     X_feat = df[feats].astype("float32").values
     n = len(df)
     if n < seq_len:
@@ -450,6 +452,7 @@ def predict_combined(
         sd = X_feat.std(0, keepdims=True) + 1e-6
 
     # Labels and weights are not needed for inference, use dummies
+    usable = n - seq_len + 1
     dummy_y = np.zeros(usable, dtype="int64")
     dummy_w = np.ones(usable, dtype="float32")
     

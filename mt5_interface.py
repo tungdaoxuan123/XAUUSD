@@ -64,11 +64,12 @@ class MT5Interface:
         """Returns open positions for the current symbol"""
         return mt5.positions_get(symbol=self.symbol)
 
-    def get_rates(self, count=100, timeframe=mt5.TIMEFRAME_M1):
+    def get_rates(self, count=100, timeframe=mt5.TIMEFRAME_M1, symbol=None):
         """Fetches OHLC rates from MT5. Defaults to M1 for the new ensemble."""
-        rates = mt5.copy_rates_from_pos(self.symbol, timeframe, 0, count)
+        target = symbol if symbol else self.symbol
+        rates = mt5.copy_rates_from_pos(target, timeframe, 0, count)
         if rates is None:
-            logger.error(f"Could not fetch rates for {self.symbol}")
+            logger.error(f"Could not fetch rates for {target}")
             return None
         return rates
 
