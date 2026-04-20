@@ -1,234 +1,253 @@
-import pandas as pd
-import numpy as np
+"""
+live_sota_trading.py (rewritten)
+================================
+
+Fixes three issues reported in production:
+
+  1. Model F1 ~0.39 and "confidence stuck at 1".
+       -> Trainer v2 (`train_sota_v2.py`) uses label smoothing + class-
+          balanced CE + temperature scaling. This file applies the saved
+          temperature at inference time, so `confidence` is a calibrated
+          probability, not a saturated argmax.
+
+  2. "Don't know when to enter".
+       -> Decisions now use the CALIBRATED probability against a
+          configurable threshold, plus spread/session/regime gates from
+          `train_pipeline.dynamic_exits.ExitPlanner`.
+
+  3. "Entries use fixed 2-ATR / 3-ATR exits".
+       -> All SL/TP + sizing now come from ExitPlanner (volatility-
+          targeted risk, confidence-scaled RR, half-Kelly sizing,
+          in-trade breakeven + chandelier trail + time stop).
+
+  Additionally, live features are now built by `train_pipeline.
+  live_features.build_live_features`, which delegates to the SAME
+  functions used during training — fixing the silent feature
+  distribution shift in the old prepare_sota_data().
+"""
+
+from __future__ import annotations
+
 import time
-import logging
 import json
 import os
+import logging
 from datetime import datetime, timedelta
+from typing import Optional
 
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
+
 try:
-    import torch_directml
+    import torch_directml  # noqa: F401
 except ImportError:
     pass
-import MetaTrader5 as mt5
+
+import MetaTrader5 as mt5  # noqa: F401  (used indirectly via interface)
 
 from config import Settings, setup_logging
 from mt5_interface import MT5Interface
 from risk_manager import FTMORiskManager
-from train_pipeline.sota_signal_generator import PatchTSTLite, LABEL_UNMAP
 
-# Setup dedicated SOTA logging
+from train_pipeline.sota_signal_generator import PatchTSTLite, LABEL_UNMAP
+from train_pipeline.live_features import build_live_features
+from train_pipeline.dynamic_exits import ExitPlanner, ExitConfig, OpenPosition
+
 logger = setup_logging()
 
+
+# ---------------------------------------------------------------------------
+# Signal generator (now with temperature-scaled probabilities)
+# ---------------------------------------------------------------------------
+
 class SOTASignalGenerator:
-    """In-process inference engine for PatchTST SOTA model"""
-    def __init__(self, model_path, config_path, device="cpu"):
+    """PatchTST inference with calibrated probabilities."""
+
+    def __init__(self, model_path: str, config_path: str, device: str = "cpu"):
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"SOTA config not found: {config_path}")
-        
         with open(config_path) as f:
             cfg = json.load(f)
-            
+
         self.features = cfg["features"]
         self.seq_len = cfg["seq_len"]
         self.patch_len = cfg["patch_len"]
-        
-        # Force CPU — DirectML silently returns zeros for Transformer ops
-        if device is not None and "privateuseone" in str(device):
-            logger.warning("DirectML detected — forcing SOTA to CPU (TransformerEncoderLayer unsupported on DirectML)")
-            device = "cpu"
+        # Temperature from v2 trainer; default 1.0 if v1 checkpoint
+        self.temperature = float(cfg.get("temperature", 1.0))
 
+        if device is not None and "privateuseone" in str(device):
+            logger.warning("DirectML detected — forcing CPU for TransformerEncoderLayer")
+            device = "cpu"
         self.device = device
-        logger.info(f"Loading SOTA model from {model_path} on {self.device}...")
-        
-        # 1. Load checkpoint on CPU first to prevent striding errors
+
+        logger.info(f"Loading SOTA model: {model_path}  T={self.temperature:.3f}")
         ckpt = torch.load(model_path, map_location="cpu")
-        
-        # 2. Initialize model on self.device (enforced CPU if DirectML)
         self.model = PatchTSTLite(
             n_features=ckpt["n_features"],
             seq_len=ckpt["seq_len"],
-            patch_len=ckpt["patch_len"]
+            patch_len=ckpt["patch_len"],
         ).to(self.device)
         self.model.load_state_dict(ckpt["state"])
         self.model.eval()
-        
-        # 3. Load normalization stats from checkpoint
-        self.mu = torch.from_numpy(ckpt["mu"]).to(self.device) if "mu" in ckpt else None
-        self.sd = torch.from_numpy(ckpt["sd"]).to(self.device) if "sd" in ckpt else None
 
-    def predict(self, df):
-        """Prepare window and run inference"""
-        # Ensure we have all necessary features
+        mu = ckpt.get("mu"); sd = ckpt.get("sd")
+        self.mu = torch.from_numpy(np.asarray(mu, dtype=np.float32)).to(self.device) if mu is not None else None
+        self.sd = torch.from_numpy(np.asarray(sd, dtype=np.float32)).to(self.device) if sd is not None else None
+        if self.mu is None:
+            logger.warning("Checkpoint lacks mu/sd — using per-window normalization (less safe)")
+
+    def predict(self, df: pd.DataFrame):
+        """Return (signal, p_buy, p_sell, p_hold, entropy)."""
         missing = [f for f in self.features if f not in df.columns]
         if missing:
-            logger.error(f"SOTA Predict: Missing features {missing}")
-            return 0, 0.5, 0.5
+            logger.error(f"Predict: missing features {missing[:5]}… ({len(missing)})")
+            return 0, 1/3, 1/3, 1/3, np.log(3)
 
-        # Get the latest window
         X = df[self.features].astype("float32").values[-self.seq_len:]
-        X = torch.tensor(X).to(self.device)
-        
-        # Normalize (Use saved stats if available, else batch-norm as fallback)
+        if len(X) < self.seq_len:
+            return 0, 1/3, 1/3, 1/3, np.log(3)
+
+        X = torch.tensor(X, device=self.device)
         if self.mu is not None and self.sd is not None:
             X = (X - self.mu) / self.sd
         else:
             X = (X - X.mean(0)) / (X.std(0) + 1e-6)
-            
-        X = X.unsqueeze(0) # (1, seq_len, F)
-        
+        X = X.unsqueeze(0)
+
         with torch.no_grad():
             logits = self.model(X)
-            probs = F.softmax(logits, dim=-1).cpu().numpy()[0]
-            
-        signal = LABEL_UNMAP[int(probs.argmax())]
-        return int(signal), float(probs[2]), float(probs[0]) # signal, p_buy, p_sell
+            # Apply temperature calibration
+            probs = F.softmax(logits / max(self.temperature, 1e-3), dim=-1)
+            p = probs.cpu().numpy()[0]
+
+        # Entropy as a secondary confidence measure (nats)
+        ent = float(-(p * np.log(p + 1e-12)).sum())
+        signal = int(LABEL_UNMAP[int(p.argmax())])
+        return signal, float(p[2]), float(p[0]), float(p[1]), ent
+
+
+# ---------------------------------------------------------------------------
+# Live trader
+# ---------------------------------------------------------------------------
 
 class LiveSOTATrader:
-    """Specialized Live Trading System for PatchTST SOTA signals"""
-    
-    def __init__(self, model_path=None, config_path=None, device=None):
+    def __init__(self, model_path=None, config_path=None, device=None,
+                 exit_config: Optional[ExitConfig] = None):
         self.settings = Settings
         self.interface = MT5Interface()
         self.risk_mgr = FTMORiskManager(self.interface)
-        
-        # Load SOTA components
-        m_path = model_path or self.settings.SOTA_MODEL_PATH
-        c_path = config_path or self.settings.SOTA_CONFIG_PATH
-        d_device = device or self.settings.SOTA_DEVICE
-        
-        self.sota = SOTASignalGenerator(m_path, c_path, d_device)
-        
-        self.current_symbol = self.interface.symbol
+
+        m = model_path or self.settings.SOTA_MODEL_PATH
+        c = config_path or self.settings.SOTA_CONFIG_PATH
+        d = device or self.settings.SOTA_DEVICE
+        self.sota = SOTASignalGenerator(m, c, d)
+
         if not self.interface.authorized:
             self.interface.initialize()
-            self.current_symbol = self.interface.symbol
-            
-        self.buy_confidence = self.settings.BUY_CONFIDENCE
-        self.sell_confidence = self.settings.SELL_CONFIDENCE
-        
-        logger.info(f"Initialized SOTA Live Trader - Symbol: {self.current_symbol}")
+        self.current_symbol = self.interface.symbol
 
-    def prepare_sota_data(self, rates):
-        """Prepare raw rates for SOTA inference with all 21 trained features"""
-        df = pd.DataFrame(rates)
-        df["time"] = pd.to_datetime(df["time"], unit="s")
-        
-        # Price Sanity Check
-        last_close = df["close"].iloc[-1]
-        if last_close > 10000:
-            logger.error(f"prepare_sota_data: Price {last_close} looks like BTC, not XAU! Check symbol.")
-            return df 
-        
-        # 1. Technical Indicators
-        # ATR (14-period)
-        high_low = df['high'] - df['low']
-        high_close = np.abs(df['high'] - df['close'].shift())
-        low_close = np.abs(df['low'] - df['close'].shift())
-        tr = np.maximum(high_low, np.maximum(high_close, low_close))
-        df['ATR'] = tr.rolling(window=14).mean()
-        
-        # VWAP Proxy
-        df['VWAP'] = (df['close'] * df['tick_volume']).rolling(100).sum() / (df['tick_volume'].rolling(100).sum() + 1e-9)
-        df['close_minus_vwap'] = df['close'] - df['VWAP']
-        
-        # 2. Synthetic Microstructure (Tick-free proxies)
-        df["tick_imbalance"] = (df["close"] - df["open"]).rolling(5).mean()
-        df["bid_ask_vol_imbalance"] = df["tick_imbalance"] 
-        
-        # Order Flow - Fixed float64 cast to prevent integer overflow
-        df["tick_volume"] = df["tick_volume"].astype("float64") 
-        df["ofi_window"] = df["tick_volume"].diff().fillna(0)
-        df["of_pressure_flag"] = np.where(df["tick_imbalance"] > 0, 1, np.where(df["tick_imbalance"] < 0, -1, 0))
-        
-        # Spread & Liquidity
-        df["spread_mean"] = (df["high"] - df["low"]).rolling(10).mean()
-        df["spread_std"] = (df["high"] - df["low"]).rolling(10).std()
-        df["kyle_lambda"] = abs(df["close"].diff()) / (df["tick_volume"] + 1e-6)
-        df["amihud_illiq"] = abs(df["close"].diff() / df["close"]) / (df["tick_volume"] + 1e-9)
-        
-        # 3. Volume Profile Proxies
-        vprof_window = 60
-        df["poc_approx"] = df["close"].rolling(vprof_window).mean()
-        df["vprof_poc_dist"] = (df["close"] - df["poc_approx"]) / (df["ATR"] + 1e-9)
-        df["vprof_in_value_area"] = 1 # Approximation
-        df["vprof_hvn_flag"] = np.where(df["tick_volume"] > df["tick_volume"].rolling(20).mean() * 1.5, 1, 0)
-        df["vprof_lvn_flag"] = 0
-        
-        # 4. Regime
-        df["jump_flag"] = np.where(abs(df["close"].diff()) > df["ATR"].shift(1) * 2.0, 1, 0)
-        df["signed_vol_z"] = (df["tick_volume"] - df["tick_volume"].rolling(20).mean()) / (df["tick_volume"].rolling(20).std() + 1e-6)
-        df["vol_regime"] = np.where(df["ATR"] > df["ATR"].rolling(50).mean(), 1, 0)
-        
-        # Final cleanup
-        df.ffill(inplace=True)
-        df.bfill(inplace=True)
-        return df
+        self.planner = ExitPlanner(exit_config or ExitConfig(
+            risk_per_trade=getattr(self.settings, "RISK_PER_TRADE", 0.005),
+            max_risk_frac=getattr(self.settings, "MAX_RISK_FRAC", 0.01),
+            min_prob_long=getattr(self.settings, "BUY_CONFIDENCE", 0.55),
+            min_prob_short=getattr(self.settings, "SELL_CONFIDENCE", 0.55),
+            max_hold_bars=getattr(self.settings, "MAX_HOLD_BARS", 30),
+        ))
+        self._open_tracker: Optional[OpenPosition] = None
+        self._bar_counter = 0
 
-    def run_live_trading(self, interval_seconds=10, dry_run=False):
-        """Main SOTA trading loop"""
-        logger.info(f"Starting SOTA MT5 Session ({interval_seconds}s intervals)...")
-        
+        logger.info(f"LiveSOTATrader ready — symbol={self.current_symbol} "
+                    f"T={self.sota.temperature:.3f} "
+                    f"min_p={self.planner.cfg.min_prob_long}")
+
+    # ---- helpers ----------------------------------------------------------
+
+    def _get_equity(self) -> float:
+        try:
+            return float(self.interface.account_info().equity)
+        except Exception:
+            return float(getattr(self.settings, "DEFAULT_EQUITY", 10000.0))
+
+    def _current_spread(self) -> float:
+        try:
+            tick = self.interface.get_tick()
+            if tick is None:
+                return 0.0
+            return float(tick.ask - tick.bid)
+        except Exception:
+            return 0.0
+
+    # ---- main loop --------------------------------------------------------
+
+    def run_live_trading(self, interval_seconds: int = 10, dry_run: bool = False):
+        logger.info(f"SOTA live loop ({interval_seconds}s intervals, dry_run={dry_run})")
         if not self.interface.initialize():
-            logger.error("MT5 Initialization failed.")
-            return
-
+            logger.error("MT5 init failed"); return
         self.risk_mgr.initialize_balance()
-        last_update = datetime.now() - timedelta(seconds=interval_seconds)
 
+        last_update = datetime.now() - timedelta(seconds=interval_seconds)
         try:
             while True:
                 now = datetime.now()
-                
-                # Check for opportunities
-                if (now - last_update).total_seconds() >= interval_seconds:
-                    # To enforce "one trade at a time", check for existing positions first
-                    positions = self.interface.get_positions()
-                    if positions is not None and len(positions) > 0:
-                        # Log status occasionally but skip the scan
-                        if now.second % 30 < 2:
-                            logger.info("Scan skipped: Position currently open.")
-                        last_update = now
-                        continue
+                if (now - last_update).total_seconds() < interval_seconds:
+                    time.sleep(1); continue
+                last_update = now
+                self._bar_counter += 1
 
-                    # Fetch 150 bars for warm-up
-                    target_symbol = "XAUUSD" if "XAU" in self.current_symbol else self.current_symbol
-                    rates = self.interface.get_rates(count=150, symbol=target_symbol)
-                    
-                    if rates is not None and len(rates) >= 60:
-                        df_enriched = self.prepare_sota_data(rates)
-                        
-                        # Sanity check: ensure data wasn't rejected by price filter
-                        if len(df_enriched.columns) < 20:
-                            last_update = now
-                            continue
-                            
-                        signal, p_buy, p_sell = self.sota.predict(df_enriched)
-                        confidence = max(p_buy, p_sell)
-                        current_price = rates[-1]['close']
-                        atr = df_enriched['ATR'].iloc[-1]
-                        
-                        logger.info(f"Scan - Signal: {signal} | Conf: {confidence:.3f} | Price: {current_price:.2f}")
+                # Skip new-entry scan while we have an open position, BUT
+                # still run in-trade management.
+                positions = self.interface.get_positions() or []
+                if len(positions) > 0:
+                    self._manage_open_positions(positions, dry_run=dry_run)
+                    continue
 
-                        if signal != 0 and (p_buy >= self.buy_confidence or p_sell >= self.sell_confidence):
-                            # Risk management
-                            sl_dist = atr * 2.0
-                            lots = self.risk_mgr.calculate_position_size(float(confidence), sl_dist)
-                            
-                            if lots > 0:
-                                sl = current_price - sl_dist if signal > 0 else current_price + sl_dist
-                                tp = current_price + (atr * 3.0) if signal > 0 else current_price - (atr * 3.0)
-                                
-                                if dry_run:
-                                    logger.info(f"DRY RUN: New Trade {'BUY' if signal > 0 else 'SELL'} {lots} lots at {current_price}")
-                                else:
-                                    self.interface.send_order(signal, lots, sl, tp)
-                                    time.sleep(2)
-                    
-                    last_update = now
-                
+                # ----- Fresh scan -------------------------------------------------
+                target = "XAUUSD" if "XAU" in self.current_symbol else self.current_symbol
+                rates = self.interface.get_rates(count=max(300, self.sota.seq_len + 50),
+                                                 symbol=target)
+                if rates is None or len(rates) < self.sota.seq_len + 30:
+                    logger.warning(f"Not enough rates ({0 if rates is None else len(rates)})")
+                    continue
+
+                rates_df = pd.DataFrame(rates)
+                df = build_live_features(rates_df, self.sota.features)
+
+                signal, p_buy, p_sell, p_hold, entropy = self.sota.predict(df)
+                prob = max(p_buy, p_sell)
+                direction_prob = p_buy if signal > 0 else p_sell if signal < 0 else p_hold
+
+                logger.info(
+                    f"scan signal={signal:+d} p_buy={p_buy:.3f} p_sell={p_sell:.3f} "
+                    f"p_hold={p_hold:.3f} H={entropy:.3f}"
+                )
+
+                if signal == 0:
+                    continue
+
+                equity = self._get_equity()
+                spread = self._current_spread()
+                plan = self.planner.build_plan(signal, direction_prob, df, equity, spread)
+                if plan.skip:
+                    logger.info(f"skip: {plan.reason}")
+                    continue
+
+                logger.info(
+                    f"PLAN {'BUY' if plan.side>0 else 'SELL'} lots={plan.lots:.2f} "
+                    f"entry={plan.entry:.2f} sl={plan.sl:.2f} tp={plan.tp:.2f} "
+                    f"RR={plan.rr:.2f} risk={plan.equity_risk*100:.2f}%"
+                )
+
+                if dry_run:
+                    continue
+
+                ok = self.interface.send_order(plan.side, plan.lots, plan.sl, plan.tp)
+                if ok:
+                    self._open_tracker = OpenPosition(
+                        side=plan.side, entry=plan.entry, sl=plan.sl, tp=plan.tp,
+                        entry_bar=self._bar_counter, best_price=plan.entry,
+                    )
                 time.sleep(2)
 
         except KeyboardInterrupt:
@@ -236,19 +255,66 @@ class LiveSOTATrader:
         finally:
             self.interface.shutdown()
 
+    # ---- in-trade management ---------------------------------------------
+
+    def _manage_open_positions(self, positions, dry_run: bool = False):
+        if self._open_tracker is None:
+            # We were restarted mid-trade; reconstruct minimal tracker from broker
+            p = positions[0]
+            self._open_tracker = OpenPosition(
+                side=+1 if p.type == 0 else -1,
+                entry=float(p.price_open),
+                sl=float(p.sl),
+                tp=float(p.tp),
+                entry_bar=self._bar_counter,
+                best_price=float(p.price_open),
+            )
+        target = "XAUUSD" if "XAU" in self.current_symbol else self.current_symbol
+        rates = self.interface.get_rates(count=max(150, self.sota.seq_len + 20),
+                                         symbol=target)
+        if rates is None:
+            return
+        df = build_live_features(pd.DataFrame(rates), self.sota.features)
+
+        upd = self.planner.manage_open(self._open_tracker, df, self._bar_counter)
+        if upd.close_reason == "time":
+            logger.info("time stop hit -> closing position")
+            if not dry_run:
+                self.interface.close_all()
+            self._open_tracker = None
+            return
+        if upd.new_sl is not None:
+            logger.info(f"SL update -> {upd.new_sl:.2f}")
+            if not dry_run:
+                pos_id = positions[0].ticket
+                self.interface.modify_sl(pos_id, upd.new_sl)
+            self._open_tracker.sl = upd.new_sl
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Live SOTA Trading with PatchTST")
-    parser.add_argument("--dry-run", action="store_true", help="Monitor without placing trades")
-    parser.add_argument("--device", type=str, help="Override SOTA_DEVICE")
-    parser.add_argument("--symbol", type=str, help="Override symbol")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Live SOTA trading (calibrated)")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--device", type=str)
+    ap.add_argument("--symbol", type=str)
+    ap.add_argument("--min-prob", type=float, default=None,
+                    help="Override calibrated probability threshold (both sides)")
+    args = ap.parse_args()
 
     if args.symbol:
         Settings.SYMBOL = args.symbol
 
-    trader = LiveSOTATrader(device=args.device)
+    exit_cfg = ExitConfig()
+    if args.min_prob is not None:
+        exit_cfg.min_prob_long = exit_cfg.min_prob_short = args.min_prob
+
+    trader = LiveSOTATrader(device=args.device, exit_config=exit_cfg)
     trader.run_live_trading(dry_run=args.dry_run)
+
 
 if __name__ == "__main__":
     main()
