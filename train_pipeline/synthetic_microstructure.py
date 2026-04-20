@@ -332,15 +332,14 @@ def rolling_volume_profile_from_bars(
     cols = ["vprof_poc_price", "vprof_poc_dist", "vprof_va_high",
             "vprof_va_low", "vprof_in_value_area",
             "vprof_hvn_flag", "vprof_lvn_flag"]
-    vp_df = pd.DataFrame(results, columns=cols, index=df.index).astype({
-        "vprof_poc_price": "float32",
-        "vprof_poc_dist": "float32",
-        "vprof_va_high": "float32",
-        "vprof_va_low": "float32",
-        "vprof_in_value_area": "int8",
-        "vprof_hvn_flag": "int8",
-        "vprof_lvn_flag": "int8",
-    })
+    vp_df = pd.DataFrame(results, columns=cols, index=df.index)
+    vp_df["vprof_poc_price"] = vp_df["vprof_poc_price"].astype("float32")
+    vp_df["vprof_poc_dist"] = vp_df["vprof_poc_dist"].astype("float32")
+    vp_df["vprof_va_high"] = vp_df["vprof_va_high"].astype("float32")
+    vp_df["vprof_va_low"] = vp_df["vprof_va_low"].astype("float32")
+    vp_df["vprof_in_value_area"] = vp_df["vprof_in_value_area"].fillna(0).astype("int8")
+    vp_df["vprof_hvn_flag"] = vp_df["vprof_hvn_flag"].fillna(0).astype("int8")
+    vp_df["vprof_lvn_flag"] = vp_df["vprof_lvn_flag"].fillna(0).astype("int8")
     return vp_df
 
 

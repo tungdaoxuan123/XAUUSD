@@ -147,7 +147,7 @@ def build_windows(
     label_col: str,
     seq_len: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build (N, seq_len, F) tensor + labels + sample weights."""
+    """Return raw 2D data for lazy slicing in WindowDataset."""
     X_feat = df[feat_cols].astype("float32").values
     y_raw = df[label_col].astype("int8").values
     w = df[SAMPLE_WEIGHT_COL].astype("float32").values if SAMPLE_WEIGHT_COL in df.columns \
@@ -158,20 +158,11 @@ def build_windows(
     if usable <= 0:
         raise ValueError(f"Not enough rows ({n}) for seq_len={seq_len}")
 
-    X = np.empty((usable, seq_len, len(feat_cols)), dtype="float32")
-    y = np.empty((usable,), dtype="int64")
-    sw = np.empty((usable,), dtype="float32")
+    # Labels and weights aligned to the END of each window
+    y = np.array([LABEL_MAP[int(y_raw[i + seq_len - 1])] for i in range(usable)], dtype="int64")
+    sw = np.array([w[i + seq_len - 1] for i in range(usable)], dtype="float32")
 
-    for i in range(usable):
-        X[i] = X_feat[i : i + seq_len]
-        y[i] = LABEL_MAP[int(y_raw[i + seq_len - 1])]
-        sw[i] = w[i + seq_len - 1]
-
-    # Per-feature z-score using train statistics
-    mu = X.reshape(-1, X.shape[-1]).mean(0, keepdims=True)
-    sd = X.reshape(-1, X.shape[-1]).std(0, keepdims=True) + 1e-6
-    X = (X - mu) / sd
-    return X, y, sw
+    return X_feat, y, sw
 
 
 # ---------------------------------------------------------------------------
@@ -256,16 +247,22 @@ if HAS_TORCH:
 
 
     class WindowDataset(Dataset):
-        def __init__(self, X, y, w):
-            self.X = torch.from_numpy(X)
+        def __init__(self, X_feat, y, w, seq_len, mu=None, sd=None):
+            self.X_feat = torch.from_numpy(X_feat)
             self.y = torch.from_numpy(y)
             self.w = torch.from_numpy(w)
+            self.seq_len = seq_len
+            self.mu = torch.from_numpy(mu) if mu is not None else None
+            self.sd = torch.from_numpy(sd) if sd is not None else None
 
         def __len__(self):
             return len(self.y)
 
         def __getitem__(self, i):
-            return self.X[i], self.y[i], self.w[i]
+            x = self.X_feat[i : i + self.seq_len]
+            if self.mu is not None and self.sd is not None:
+                x = (x - self.mu) / self.sd
+            return x, self.y[i], self.w[i]
 
 
 # ---------------------------------------------------------------------------
@@ -273,8 +270,9 @@ if HAS_TORCH:
 # ---------------------------------------------------------------------------
 
 def train_primary(
-    X: np.ndarray, y: np.ndarray, w: np.ndarray,
+    X_feat: np.ndarray, y: np.ndarray, w: np.ndarray,
     out_dir: str,
+    seq_len: int,
     patch_len: int = 12,
     epochs: int = 20,
     batch_size: int = 128,
@@ -286,10 +284,18 @@ def train_primary(
                      "Use train_ensemble_gpu.py as fallback.")
         return None
 
-    n, seq_len, n_feat = X.shape
-    # Walk-forward split (70/30)
-    cut = int(n * 0.7)
-    X_tr, X_va = X[:cut], X[cut:]
+    n_usable = len(y)
+    n_feat = X_feat.shape[1]
+    
+    # 1. Walk-forward split (70/30) on window indices
+    cut = int(n_usable * 0.7)
+    
+    # 2. Compute normalization stats on TRAINING SLICE ONLY (safeguard against leakage)
+    train_feat_slice = X_feat[: cut + seq_len]
+    mu = train_feat_slice.mean(0, keepdims=True)
+    sd = train_feat_slice.std(0, keepdims=True) + 1e-6
+    logger.info(f"Normalizing with train-only stats: mu_max={mu.max():.4f} sd_avg={sd.mean():.4f}")
+
     y_tr, y_va = y[:cut], y[cut:]
     w_tr, w_va = w[:cut], w[cut:]
 
@@ -304,10 +310,13 @@ def train_primary(
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     loss_fn = FocalLoss(gamma=2.0, alpha=alpha)
 
-    train_loader = DataLoader(WindowDataset(X_tr, y_tr, w_tr),
-                              batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(WindowDataset(X_va, y_va, w_va),
-                            batch_size=batch_size, shuffle=False)
+    train_ds = WindowDataset(X_feat[:cut + seq_len], y_tr, w_tr, seq_len, mu, sd)
+    val_ds = WindowDataset(X_feat[cut:], y_va, w_va, seq_len, mu, sd)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, 
+                              drop_last=True, num_workers=0, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, 
+                            num_workers=0, pin_memory=True)
 
     best_f1 = -1.0
     os.makedirs(out_dir, exist_ok=True)
@@ -355,7 +364,9 @@ def train_primary(
             torch.save({"state": model.state_dict(),
                         "n_features": n_feat,
                         "seq_len": seq_len,
-                        "patch_len": patch_len}, model_path)
+                        "patch_len": patch_len,
+                        "mu": mu,
+                        "sd": sd}, model_path)
 
     logger.info(f"Best val macro-F1: {best_f1:.4f}  saved -> {model_path}")
     return model_path
@@ -429,24 +440,37 @@ def predict_combined(
     if n < seq_len:
         raise ValueError(f"Need at least {seq_len} rows, got {n}")
 
-    # Build rolling windows
-    usable = n - seq_len + 1
-    X = np.empty((usable, seq_len, len(feats)), dtype="float32")
-    for i in range(usable):
-        X[i] = X_feat[i : i + seq_len]
-    # z-score per-feature
-    mu = X.reshape(-1, X.shape[-1]).mean(0, keepdims=True)
-    sd = X.reshape(-1, X.shape[-1]).std(0, keepdims=True) + 1e-6
-    X = (X - mu) / sd
+    # Normalize using mean/std from checkpoint
+    mu = ckpt.get("mu")
+    sd = ckpt.get("sd")
+    if mu is None:
+        # Fallback for old checkpoints
+        logger.warning("Checkpoint missing normalization stats. Re-computing from input (LEAKAGE RISK).")
+        mu = X_feat.mean(0, keepdims=True)
+        sd = X_feat.std(0, keepdims=True) + 1e-6
 
-    ckpt = torch.load(primary_path, map_location=device)
+    # Labels and weights are not needed for inference, use dummies
+    dummy_y = np.zeros(usable, dtype="int64")
+    dummy_w = np.ones(usable, dtype="float32")
+    
+    predict_ds = WindowDataset(X_feat, dummy_y, dummy_w, seq_len, mu, sd)
+    predict_loader = DataLoader(predict_ds, batch_size=256, shuffle=False, 
+                                num_workers=0, pin_memory=True)
+
+    ckpt_state = ckpt["state"]
     model = PatchTSTLite(n_features=ckpt["n_features"], seq_len=ckpt["seq_len"],
                          patch_len=ckpt["patch_len"]).to(device)
-    model.load_state_dict(ckpt["state"])
+    model.load_state_dict(ckpt_state)
     model.eval()
+
+    probs_list = []
     with torch.no_grad():
-        logits = model(torch.from_numpy(X).to(device))
-        probs = F.softmax(logits, dim=-1).cpu().numpy()
+        for xb, _, _ in predict_loader:
+            logits = model(xb.to(device))
+            probs = F.softmax(logits, dim=-1).cpu().numpy()
+            probs_list.append(probs)
+    
+    probs = np.concatenate(probs_list, axis=0)
     primary = np.argmax(probs, axis=1)
     primary_cls = np.array([LABEL_UNMAP[c] for c in primary], dtype="int8")
 
@@ -490,12 +514,30 @@ def main():
     p.add_argument("--meta-threshold", type=float, default=0.55)
     args = p.parse_args()
 
-    device = "cuda" if (args.gpu and HAS_TORCH and torch.cuda.is_available()) else "cpu"
+    if args.gpu and HAS_TORCH:
+        if torch.cuda.is_available():
+            device = "cuda"
+        else:
+            try:
+                import torch_directml
+                if torch_directml.is_available():
+                    device = torch_directml.device()
+                else:
+                    device = "cpu"
+            except ImportError:
+                device = "cpu"
+    else:
+        device = "cpu"
     logger.info(f"Device: {device}")
 
     df = pd.read_csv(args.data)
     df.columns = [c.lower().strip() if c != "ATR" else c for c in df.columns]
-    # normalize to consistent casing for ATR + indicator columns
+    
+    # Handle NaNs from technical indicators
+    df.ffill(inplace=True)
+    df.bfill(inplace=True)
+    
+    # Normalize to consistent casing for ATR + indicator columns
     rename_map = {c: c for c in df.columns}
     df.rename(columns=rename_map, inplace=True)
 
@@ -523,6 +565,7 @@ def main():
     primary_path = train_primary(
         X, y, w,
         out_dir=args.out_dir,
+        seq_len=args.seq_len,
         patch_len=args.patch_len,
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -534,17 +577,24 @@ def main():
     if primary_path and HAS_TORCH:
         with torch.no_grad():
             model_ckpt = torch.load(primary_path, map_location=device)
+            mu = model_ckpt.get("mu")
+            sd = model_ckpt.get("sd")
+            
             model = PatchTSTLite(n_features=model_ckpt["n_features"],
                                  seq_len=model_ckpt["seq_len"],
                                  patch_len=model_ckpt["patch_len"]).to(device)
             model.load_state_dict(model_ckpt["state"])
             model.eval()
-            # Re-build un-shuffled windows to emit preds aligned to df rows
+            # Re-build windows via Dataset for alignment and RAM safety
+            dummy_y = np.zeros(len(y), dtype="int64")
+            dummy_w = np.ones(len(y), dtype="float32")
+            preds_ds = WindowDataset(X, dummy_y, dummy_w, args.seq_len, mu, sd)
+            preds_loader = DataLoader(preds_ds, batch_size=256, shuffle=False, 
+                                      num_workers=0, pin_memory=True)
+            
             preds_full = []
-            batch = 256
-            for i in range(0, len(X), batch):
-                xb = torch.from_numpy(X[i:i + batch]).to(device)
-                p = model(xb).argmax(-1).cpu().numpy()
+            for xb, _, _ in preds_loader:
+                p = model(xb.to(device)).argmax(-1).cpu().numpy()
                 preds_full.append(p)
             preds_full = np.concatenate(preds_full)
             primary_cls = np.array([LABEL_UNMAP[c] for c in preds_full], dtype="int8")
