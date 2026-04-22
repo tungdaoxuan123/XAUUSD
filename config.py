@@ -18,7 +18,7 @@ class Settings:
     INITIAL_BALANCE = 10000.0
     MAX_DAILY_LOSS_PCT = 4.8
     MAX_TOTAL_LOSS_PCT = 9.5
-    MAX_POSITIONS = 1
+    MAX_POSITIONS = 3
     RISK_PER_TRADE_PCT = 0.1 # 0.1% = $10.00 risk
     MAX_LOT_SIZE = 0.03
     DEFAULT_LOT_SIZE = 0.03
@@ -36,6 +36,10 @@ class Settings:
     
     # Paths
     ENSEMBLE_MODEL_PATH = os.getenv("ENSEMBLE_MODEL_PATH", "train_pipeline/models_dukas_300b/")
+    # SOTA Model
+    SOTA_MODEL_PATH = os.getenv("SOTA_MODEL_PATH", "train_pipeline/models_sota_v2/checkpoint.pt")
+    SOTA_CONFIG_PATH = os.getenv("SOTA_CONFIG_PATH", "train_pipeline/models_sota_v2/sota_config.json")
+    SOTA_DEVICE = "cpu"  # DirectML doesn't support TransformerEncoderLayer logic accurately
     LOG_FILE = "ftmo_trading.log"
 
 def setup_logging():

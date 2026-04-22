@@ -1,15 +1,29 @@
 """
-live_sota_trading.py — LONG-ONLY SOTA live bot
-===============================================
+live_sota_trading.py (rewritten)
+================================
 
-Uses PatchTST-lite transformer with temperature-calibrated probabilities
-for LONG-ONLY entry decisions. Fixed 2:1 ATR-derived TP/SL via ExitPlanner.
+Fixes three issues reported in production:
 
-Key changes for long-only redesign:
-  - binary exit planning (no short side)
-  - Entry filter: p_long > min_prob_long only
-  - 2:1 RR: tp_dist = 2 × sl_dist
-  - No trailing / in-trade management beyond exit
+  1. Model F1 ~0.39 and "confidence stuck at 1".
+       -> Trainer v2 (`train_sota_v2.py`) uses label smoothing + class-
+          balanced CE + temperature scaling. This file applies the saved
+          temperature at inference time, so `confidence` is a calibrated
+          probability, not a saturated argmax.
+
+  2. "Don't know when to enter".
+       -> Decisions now use the CALIBRATED probability against a
+          configurable threshold, plus spread/session/regime gates from
+          `train_pipeline.dynamic_exits.ExitPlanner`.
+
+  3. "Entries use fixed 2-ATR / 3-ATR exits".
+       -> All SL/TP + sizing now come from ExitPlanner (volatility-
+          targeted risk, confidence-scaled RR, half-Kelly sizing,
+          in-trade breakeven + chandelier trail + time stop).
+
+  Additionally, live features are now built by `train_pipeline.
+  live_features.build_live_features`, which delegates to the SAME
+  functions used during training — fixing the silent feature
+  distribution shift in the old prepare_sota_data().
 """
 
 from __future__ import annotations
@@ -37,7 +51,7 @@ from config import Settings, setup_logging
 from mt5_interface import MT5Interface
 from risk_manager import FTMORiskManager
 
-from train_pipeline.sota_signal_generator import PatchTSTLite
+from train_pipeline.sota_signal_generator import PatchTSTLite, LABEL_UNMAP
 from train_pipeline.live_features import build_live_features
 from train_pipeline.dynamic_exits import ExitPlanner, ExitConfig, OpenPosition
 
@@ -69,37 +83,16 @@ class SOTASignalGenerator:
         self.device = device
 
         logger.info(f"Loading SOTA model: {model_path}  T={self.temperature:.3f}")
-        ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+        ckpt = torch.load(model_path, map_location="cpu")
         # Initialize model with robust metadata retrieval
         n_features = ckpt.get("n_features", len(ckpt.get("features", [])))
         if n_features == 0:
             n_features = len(self.features)
 
         # Retrieve architectural settings (defaulting to v2 trainer defaults)
-        # If metadata is missing (v1 models), infer from state dict shapes
-        state = ckpt.get("state", {})
-        
-        # d_model detection
-        d_model = ckpt.get("d_model")
-        if d_model is None:
-            if "pos_embed" in state:
-                d_model = state["pos_embed"].shape[-1]
-            elif "patch_embed.weight" in state:
-                d_model = state["patch_embed.weight"].shape[0]
-            else:
-                d_model = 96 # Final fallback
-        
-        # n_layers detection
-        n_layers = ckpt.get("n_layers")
-        if n_layers is None:
-            # Count the highest layer index in the state dict
-            layer_keys = [k for k in state.keys() if "encoder.layers." in k]
-            if layer_keys:
-                n_layers = max([int(k.split(".")[2]) for k in layer_keys]) + 1
-            else:
-                n_layers = 3 # Final fallback
-
-        n_heads = ckpt.get("n_heads", 4)
+        d_model  = ckpt.get("d_model", 96)
+        n_heads  = ckpt.get("n_heads", 4)
+        n_layers = ckpt.get("n_layers", 3)
 
         self.model = PatchTSTLite(
             n_features=n_features,
@@ -119,15 +112,15 @@ class SOTASignalGenerator:
             logger.warning("Checkpoint lacks mu/sd — using per-window normalization (less safe)")
 
     def predict(self, df: pd.DataFrame):
-        """Return (signal, p_long, p_wait, entropy)."""
+        """Return (signal, p_buy, p_sell, p_hold, entropy)."""
         missing = [f for f in self.features if f not in df.columns]
         if missing:
             logger.error(f"Predict: missing features {missing[:5]}… ({len(missing)})")
-            return 0, 0.5, 0.5, np.log(2)
+            return 0, 1/3, 1/3, 1/3, np.log(3)
 
         X = df[self.features].astype("float32").values[-self.seq_len:]
         if len(X) < self.seq_len:
-            return 0, 0.5, 0.5, np.log(2)
+            return 0, 1/3, 1/3, 1/3, np.log(3)
 
         X = torch.tensor(X, device=self.device)
         if self.mu is not None and self.sd is not None:
@@ -138,19 +131,14 @@ class SOTASignalGenerator:
 
         with torch.no_grad():
             logits = self.model(X)
+            # Apply temperature calibration
             probs = F.softmax(logits / max(self.temperature, 1e-3), dim=-1)
             p = probs.cpu().numpy()[0]
 
+        # Entropy as a secondary confidence measure (nats)
         ent = float(-(p * np.log(p + 1e-12)).sum())
-        # Binary: class 1 = LONG, class 0 = WAIT
-        if p.shape[0] >= 2:
-            p_long = float(p[1])
-            p_wait = float(p[0])
-        else:
-            p_long = float(p[0])
-            p_wait = 1.0 - p_long
-        signal = 1 if p_long > 0.5 else 0
-        return signal, p_long, p_wait, ent
+        signal = int(LABEL_UNMAP[int(p.argmax())])
+        return signal, float(p[2]), float(p[0]), float(p[1]), ent
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +147,7 @@ class SOTASignalGenerator:
 
 class LiveSOTATrader:
     def __init__(self, model_path=None, config_path=None, device=None,
-                 exit_config: Optional[ExitConfig] = None, direction: int = 1):
+                 exit_config: Optional[ExitConfig] = None):
         self.settings = Settings
         self.interface = MT5Interface()
         self.risk_mgr = FTMORiskManager(self.interface)
@@ -172,35 +160,21 @@ class LiveSOTATrader:
         if not self.interface.authorized:
             self.interface.initialize()
         self.current_symbol = self.interface.symbol
-        self.direction = direction
 
-        if "GBP" in self.current_symbol:
-            base_cfg = ExitConfig(
-                atr_mult_sl=1.0,
-                min_sl_pips=0.00050,
-                contract_size=100000.0,
-                max_hold_bars=45,
-            )
-        else:
-            base_cfg = ExitConfig(
-                min_sl_pips=1.5,
-                contract_size=100.0,
-            )
-
-        if exit_config:
-            base_cfg.min_prob = exit_config.min_prob
-
-        self.planner = ExitPlanner(base_cfg, direction=direction)
-
+        self.planner = ExitPlanner(exit_config or ExitConfig(
+            risk_per_trade=getattr(self.settings, "RISK_PER_TRADE", 0.005),
+            max_risk_frac=getattr(self.settings, "MAX_RISK_FRAC", 0.01),
+            min_prob_long=getattr(self.settings, "BUY_CONFIDENCE", 0.55),
+            min_prob_short=getattr(self.settings, "SELL_CONFIDENCE", 0.55),
+            max_hold_bars=getattr(self.settings, "MAX_HOLD_BARS", 30),
+        ))
         self._trackers: Dict[int, OpenPosition] = {}
         self._bar_counter = 0
         self._last_order_bar = -1
-        side_label = "LONG" if direction > 0 else "SHORT"
-        logger.info(
-            f"{side_label}-ONLY SOTA Trader ready — symbol={self.current_symbol} "
-            f"T={self.sota.temperature:.3f} "
-            f"min_p={self.planner.cfg.min_prob:.2f}"
-        )
+
+        logger.info(f"LiveSOTATrader ready — symbol={self.current_symbol} "
+                    f"T={self.sota.temperature:.3f} "
+                    f"min_p={self.planner.cfg.min_prob_long}")
 
     # ---- helpers ----------------------------------------------------------
 
@@ -222,8 +196,7 @@ class LiveSOTATrader:
     # ---- main loop --------------------------------------------------------
 
     def run_live_trading(self, interval_seconds: int = 10, dry_run: bool = False):
-        side_label = "LONG" if self.direction > 0 else "SHORT"
-        logger.info(f"{side_label}-ONLY SOTA live loop ({interval_seconds}s, dry_run={dry_run})")
+        logger.info(f"SOTA live loop ({interval_seconds}s intervals, dry_run={dry_run})")
         if not self.interface.initialize():
             logger.error("MT5 init failed"); return
         self.risk_mgr.initialize_balance()
@@ -237,16 +210,18 @@ class LiveSOTATrader:
                 last_update = now
                 self._bar_counter += 1
 
+                # Always manage open positions first
                 positions = self.interface.get_positions() or []
                 self._manage_open_positions(positions, dry_run=dry_run)
 
+                # Skip new-entry scan ONLY if we are at max capacity
                 if len(positions) >= self.settings.MAX_POSITIONS:
                     continue
 
+                # ----- Fresh scan -------------------------------------------------
                 target = "XAUUSD" if "XAU" in self.current_symbol else self.current_symbol
-                rates = self.interface.get_rates(
-                    count=max(300, self.sota.seq_len + 50), symbol=target
-                )
+                rates = self.interface.get_rates(count=max(300, self.sota.seq_len + 50),
+                                                 symbol=target)
                 if rates is None or len(rates) < self.sota.seq_len + 30:
                     logger.warning(f"Not enough rates ({0 if rates is None else len(rates)})")
                     continue
@@ -254,12 +229,13 @@ class LiveSOTATrader:
                 rates_df = pd.DataFrame(rates)
                 df = build_live_features(rates_df, self.sota.features)
 
-                signal, p_long, p_wait, entropy = self.sota.predict(df)
+                signal, p_buy, p_sell, p_hold, entropy = self.sota.predict(df)
+                prob = max(p_buy, p_sell)
+                direction_prob = p_buy if signal > 0 else p_sell if signal < 0 else p_hold
 
-                side_label = "LONG" if self.direction > 0 else "SHORT"
                 logger.info(
-                    f"scan signal={side_label if signal>0 else 'WAIT'} "
-                    f"p_long={p_long:.3f} p_wait={p_wait:.3f} H={entropy:.3f}"
+                    f"scan signal={signal:+d} p_buy={p_buy:.3f} p_sell={p_sell:.3f} "
+                    f"p_hold={p_hold:.3f} H={entropy:.3f}"
                 )
 
                 if signal == 0:
@@ -267,13 +243,13 @@ class LiveSOTATrader:
 
                 equity = self._get_equity()
                 spread = self._current_spread()
-                plan = self.planner.build_plan(signal, p_long, df, equity, spread)
+                plan = self.planner.build_plan(signal, direction_prob, df, equity, spread)
                 if plan.skip:
                     logger.info(f"skip: {plan.reason}")
                     continue
 
                 logger.info(
-                    f"PLAN LONG lots={plan.lots:.2f} "
+                    f"PLAN {'BUY' if plan.side>0 else 'SELL'} lots={plan.lots:.2f} "
                     f"entry={plan.entry:.2f} sl={plan.sl:.2f} tp={plan.tp:.2f} "
                     f"RR={plan.rr:.2f} risk={plan.equity_risk*100:.2f}%"
                 )
@@ -281,10 +257,7 @@ class LiveSOTATrader:
                 if dry_run:
                     continue
 
-                ticket = self.interface.send_order(
-                    plan.side, plan.lots, plan.sl, plan.tp,
-                    max_slippage_pts=self.interface.dynamic_deviation(spread_pts=spread)
-                )
+                ticket = self.interface.send_order(plan.side, plan.lots, plan.sl, plan.tp)
                 if ticket:
                     self._trackers[ticket] = OpenPosition(
                         side=plan.side, entry=plan.entry, sl=plan.sl, tp=plan.tp,
@@ -306,14 +279,14 @@ class LiveSOTATrader:
             return
 
         active_tickets = [p.ticket for p in positions]
+        # Clean up dead trackers
         dead = [tid for tid in self._trackers if tid not in active_tickets]
         for tid in dead:
             del self._trackers[tid]
 
         target = "XAUUSD" if "XAU" in self.current_symbol else self.current_symbol
-        rates = self.interface.get_rates(
-            count=max(200, self.sota.seq_len + 30), symbol=target
-        )
+        rates = self.interface.get_rates(count=max(200, self.sota.seq_len + 30),
+                                         symbol=target)
         if rates is None:
             return
         df = build_live_features(pd.DataFrame(rates), self.sota.features)
@@ -322,8 +295,9 @@ class LiveSOTATrader:
             tid = p.ticket
             tracker = self._trackers.get(tid)
             if tracker is None:
+                # Reconstruct tracker for untracked position
                 tracker = OpenPosition(
-                    side=self.direction,
+                    side=+1 if p.type == 0 else -1,
                     entry=float(p.price_open),
                     sl=float(p.sl),
                     tp=float(p.tp),
@@ -341,8 +315,7 @@ class LiveSOTATrader:
                 continue
 
             if upd.new_sl is not None:
-                fmt = ".5f" if "GBP" in self.current_symbol else ".2f"
-                logger.info(f"Ticket {tid}: SL update -> {upd.new_sl:{fmt}}")
+                logger.info(f"Ticket {tid}: SL update -> {upd.new_sl:.2f}")
                 if not dry_run:
                     self.interface.modify_sl(tid, upd.new_sl)
                 tracker.sl = upd.new_sl
@@ -354,14 +327,12 @@ class LiveSOTATrader:
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(description="Live SOTA trading (long or short)")
+    ap = argparse.ArgumentParser(description="Live SOTA trading (calibrated)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--device", type=str)
     ap.add_argument("--symbol", type=str)
     ap.add_argument("--min-prob", type=float, default=None,
-                    help="Override min probability threshold")
-    ap.add_argument("--side", type=str, default="long", choices=["long", "short"],
-                    help="Trade direction")
+                    help="Override calibrated probability threshold (both sides)")
     args = ap.parse_args()
 
     if args.symbol:
@@ -369,10 +340,9 @@ def main():
 
     exit_cfg = ExitConfig()
     if args.min_prob is not None:
-        exit_cfg.min_prob = args.min_prob
+        exit_cfg.min_prob_long = exit_cfg.min_prob_short = args.min_prob
 
-    direction = 1 if args.side == "long" else -1
-    trader = LiveSOTATrader(device=args.device, exit_config=exit_cfg, direction=direction)
+    trader = LiveSOTATrader(device=args.device, exit_config=exit_cfg)
     trader.run_live_trading(dry_run=args.dry_run)
 
 
