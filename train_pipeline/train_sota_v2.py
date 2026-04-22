@@ -55,6 +55,12 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import torch_directml
+    HAS_DIRECTML = True
+except ImportError:
+    HAS_DIRECTML = False
+
 from sota_signal_generator import (  # noqa: E402
     PatchTSTLite, FEATURE_COLS, LABEL_MAP, LABEL_UNMAP,
     _select_available, SAMPLE_WEIGHT_COL,
@@ -99,51 +105,47 @@ def add_session_features(df: pd.DataFrame) -> pd.DataFrame:
 # Dataset with sequence mixup
 # ---------------------------------------------------------------------------
 
-class WindowDS(Dataset):
-    def __init__(self, X, y, w):
-        self.X = torch.from_numpy(X)
-        self.y = torch.from_numpy(y)
-        self.w = torch.from_numpy(w)
+class LazyWindowDS(Dataset):
+    def __init__(self, X_feat, y_raw, w_raw, seq_len, indices, mu, sd):
+        self.X_feat = X_feat          # (N, F), np.ndarray
+        self.y_raw = y_raw            # (N,)
+        self.w_raw = w_raw            # (N,)
+        self.seq_len = seq_len
+        self.indices = indices        # array of usable window starts
+        self.mu = mu
+        self.sd = sd
 
     def __len__(self):
-        return len(self.y)
+        return len(self.indices)
 
-    def __getitem__(self, i):
-        return self.X[i], self.y[i], self.w[i]
+    def __getitem__(self, idx):
+        start = self.indices[idx]
+        end = start + self.seq_len
+        
+        # Slice window
+        x = self.X_feat[start:end]    # (seq_len, F)
+        
+        # Label and weight from the LAST bar in the window
+        # (Consistent with Triple Barrier mapping)
+        y = LABEL_MAP[int(self.y_raw[end - 1])]
+        w = self.w_raw[end - 1]
 
+        # Apply normalization using TRAIN stats
+        x = (x - self.mu) / (self.sd + 1e-9)
+
+        x = torch.from_numpy(x.astype("float32"))
+        y = torch.tensor(y, dtype=torch.long)
+        w = torch.tensor(w, dtype=torch.float32)
+        return x, y, w
 
 def mixup_batch(x, y, w, alpha=0.1):
-    """Sequence-level mixup: x_mix = λx_i + (1-λ)x_j on the *input* only;
-    target stays hard (keep calibration tight)."""
+    """Sequence-level mixup: x_mix = λx_i + (1-λ)x_j on the *input* only."""
     if alpha <= 0:
         return x, y, w
     lam = float(np.random.beta(alpha, alpha))
     idx = torch.randperm(x.size(0), device=x.device)
     x_mix = lam * x + (1 - lam) * x[idx]
-    # keep original hard labels (use dominant side)
     return x_mix, y, w
-
-
-# ---------------------------------------------------------------------------
-# Window construction with purged walk-forward split
-# ---------------------------------------------------------------------------
-
-def build_windows(df, feats, label_col, seq_len):
-    X_feat = df[feats].astype("float32").values
-    y_raw = df[label_col].astype("int8").values
-    w = df[SAMPLE_WEIGHT_COL].astype("float32").values if SAMPLE_WEIGHT_COL in df.columns \
-        else np.ones(len(df), dtype="float32")
-
-    n = len(df)
-    usable = n - seq_len
-    X = np.empty((usable, seq_len, len(feats)), dtype="float32")
-    y = np.empty((usable,), dtype="int64")
-    sw = np.empty((usable,), dtype="float32")
-    for i in range(usable):
-        X[i] = X_feat[i:i+seq_len]
-        y[i] = LABEL_MAP[int(y_raw[i+seq_len-1])]
-        sw[i] = w[i+seq_len-1]
-    return X, y, sw
 
 
 def purged_split(n, embargo_frac=0.01, val_frac=0.2):
@@ -227,7 +229,15 @@ def macro_f1(y_true, y_pred, n_cls=3):
 # ---------------------------------------------------------------------------
 
 def train(args):
-    device = "cuda" if (args.gpu and torch.cuda.is_available()) else "cpu"
+    if args.gpu:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif HAS_DIRECTML:
+            device = torch_directml.device()
+        else:
+            device = "cpu"
+    else:
+        device = "cpu"
     logger.info(f"device={device}")
 
     df = pd.read_csv(args.data)
@@ -243,31 +253,57 @@ def train(args):
     if args.label_col not in df.columns:
         sys.exit(f"{args.label_col} column missing — run triple_barrier_labels.py first.")
 
-    # Drop rows with NaN in feats/label
+    # Extract arrays for lazy windowing after dropping NaNs
     df = df.dropna(subset=feats + [args.label_col]).reset_index(drop=True)
-    X, y, w = build_windows(df, feats, args.label_col, args.seq_len)
-    logger.info(f"windows: X={X.shape}  label dist={np.bincount(y).tolist()}")
+    X_feat = df[feats].astype("float32").values
+    
+    # Critical Safety Check
+    nan_count = np.isnan(X_feat).sum()
+    inf_count = np.isinf(X_feat).sum()
+    if nan_count > 0 or inf_count > 0:
+        logger.warning(f"Data contains {nan_count} NaNs and {inf_count} Infs! Removing them...")
+        X_feat = np.nan_to_num(X_feat, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    y_raw = df[args.label_col].astype("int8").values
+    w_raw = df[SAMPLE_WEIGHT_COL].astype("float32").values if SAMPLE_WEIGHT_COL in df.columns \
+            else np.ones(len(df), dtype="float32")
 
-    # Per-feature normalization computed on TRAIN portion only
-    tr, va = purged_split(len(X), embargo_frac=0.01, val_frac=0.2)
-    mu = X[tr].reshape(-1, X.shape[-1]).mean(0, keepdims=True)
-    sd = X[tr].reshape(-1, X.shape[-1]).std(0, keepdims=True) + 1e-6
-    Xn = (X - mu) / sd
+    usable = len(df) - args.seq_len
+    tr, va = purged_split(usable, embargo_frac=0.01, val_frac=0.2)
+    
+    # Compute normalization statistics on TRAIN period portion only
+    # To include all data covered by training windows: [0, max(tr) + seq_len)
+    max_train_end = int(tr.max() + args.seq_len)
+    X_train_slice = X_feat[:max_train_end]
+    mu = X_train_slice.mean(axis=0, keepdims=True)
+    sd = X_train_slice.std(axis=0, keepdims=True) + 1e-6
+    
+    logger.info(f"Data: total={len(df)}, usable_windows={usable}, train_range={max_train_end}")
+    logger.info(f"Normalization: mu.shape={mu.shape}, sd.shape={sd.shape}")
+
+    # Loaders with LazyWindowDS
+    train_ds = LazyWindowDS(X_feat, y_raw, w_raw, args.seq_len, indices=tr, mu=mu, sd=sd)
+    val_ds   = LazyWindowDS(X_feat, y_raw, w_raw, args.seq_len, indices=va, mu=mu, sd=sd)
+    
+    train_ld = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True,
+        num_workers=4, pin_memory=True
+    )
+    val_ld = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=2, pin_memory=True
+    )
 
     # Class-balanced weights (Cui et al. 2019): w_c = (1-β) / (1-β^n_c)
+    # Extract training labels to compute frequencies
+    y_tr = np.array([LABEL_MAP[int(y_raw[idx + args.seq_len - 1])] for idx in tr])
     beta = 0.9999
-    cls_counts = np.bincount(y[tr], minlength=3).astype("float64")
+    cls_counts = np.bincount(y_tr, minlength=3).astype("float64")
     eff_num = 1.0 - np.power(beta, cls_counts)
     cb = (1.0 - beta) / np.maximum(eff_num, 1e-9)
     cb = cb / cb.sum() * 3.0
     class_weights = torch.tensor(cb, dtype=torch.float32, device=device)
     logger.info(f"class-balanced weights: {cb.tolist()}")
-
-    # Loaders
-    train_ds = WindowDS(Xn[tr], y[tr], w[tr])
-    val_ds   = WindowDS(Xn[va], y[va], w[va])
-    train_ld = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
-    val_ld   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
 
     # Model
     model = PatchTSTLite(
@@ -295,8 +331,25 @@ def train(args):
     patience, bad = args.patience, 0
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     model_path = os.path.join(args.out_dir, "patchtst_primary.pt")
+    ckpt_path = os.path.join(args.out_dir, "checkpoint.pt")
+    
+    start_epoch = 1
+    
+    # RESUME Logic
+    if args.resume and os.path.exists(ckpt_path):
+        logger.info(f"Attempting to resume from {ckpt_path}...")
+        res_ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(res_ckpt["state"])
+        opt.load_state_dict(res_ckpt["optimizer_state"])
+        if "scheduler_state" in res_ckpt:
+            sched.load_state_dict(res_ckpt["scheduler_state"])
+        
+        start_epoch = res_ckpt["epoch"] + 1
+        best_f1 = res_ckpt["best_f1"]
+        best_state = res_ckpt["state"]
+        logger.info(f"Resumed from epoch {res_ckpt['epoch']} (Best F1: {best_f1:.4f})")
 
-    for ep in range(1, args.epochs+1):
+    for ep in range(start_epoch, args.epochs + 1):
         model.train()
         tot = 0.0
         n_batch = 0
@@ -335,6 +388,25 @@ def train(args):
             best_f1 = f1
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             bad = 0
+            
+            # Save durable checkpoint
+            torch.save({
+                "epoch": ep,
+                "state": best_state,
+                "optimizer_state": opt.state_dict(),
+                "scheduler_state": sched.state_dict(),
+                "best_f1": best_f1,
+                "n_features": len(feats),
+                "seq_len": args.seq_len,
+                "patch_len": args.patch_len,
+                "d_model": args.d_model,
+                "n_heads": args.n_heads,
+                "n_layers": args.n_layers,
+                "mu": mu,
+                "sd": sd,
+                "features": feats,
+            }, ckpt_path)
+            logger.info(f"Checkpoint saved to {ckpt_path}")
         else:
             bad += 1
             if bad >= patience:
@@ -366,6 +438,9 @@ def train(args):
         "n_features": len(feats),
         "seq_len": args.seq_len,
         "patch_len": args.patch_len,
+        "d_model": args.d_model,
+        "n_heads": args.n_heads,
+        "n_layers": args.n_layers,
         "mu": mu.astype("float32").squeeze(0),   # (F,)
         "sd": sd.astype("float32").squeeze(0),
         "features": feats,
@@ -398,7 +473,7 @@ def parse_args():
     p.add_argument("--patch-len", type=int, default=12)
     p.add_argument("--epochs", type=int, default=40)
     p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--d-model", type=int, default=96)
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--n-layers", type=int, default=3)
@@ -408,6 +483,7 @@ def parse_args():
     p.add_argument("--patience", type=int, default=6)
     p.add_argument("--meta-threshold", type=float, default=0.55)
     p.add_argument("--gpu", action="store_true")
+    p.add_argument("--resume", action="store_true", help="Resume from checkpoint.pt if exists")
     return p.parse_args()
 
 

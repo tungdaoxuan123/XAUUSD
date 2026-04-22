@@ -84,10 +84,23 @@ class SOTASignalGenerator:
 
         logger.info(f"Loading SOTA model: {model_path}  T={self.temperature:.3f}")
         ckpt = torch.load(model_path, map_location="cpu")
+        # Initialize model with robust metadata retrieval
+        n_features = ckpt.get("n_features", len(ckpt.get("features", [])))
+        if n_features == 0:
+            n_features = len(self.features)
+
+        # Retrieve architectural settings (defaulting to v2 trainer defaults)
+        d_model  = ckpt.get("d_model", 96)
+        n_heads  = ckpt.get("n_heads", 4)
+        n_layers = ckpt.get("n_layers", 3)
+
         self.model = PatchTSTLite(
-            n_features=ckpt["n_features"],
-            seq_len=ckpt["seq_len"],
-            patch_len=ckpt["patch_len"],
+            n_features=n_features,
+            seq_len=ckpt.get("seq_len", self.seq_len),
+            patch_len=ckpt.get("patch_len", self.patch_len),
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers
         ).to(self.device)
         self.model.load_state_dict(ckpt["state"])
         self.model.eval()
@@ -155,8 +168,9 @@ class LiveSOTATrader:
             min_prob_short=getattr(self.settings, "SELL_CONFIDENCE", 0.55),
             max_hold_bars=getattr(self.settings, "MAX_HOLD_BARS", 30),
         ))
-        self._open_tracker: Optional[OpenPosition] = None
+        self._trackers: Dict[int, OpenPosition] = {}
         self._bar_counter = 0
+        self._last_order_bar = -1
 
         logger.info(f"LiveSOTATrader ready — symbol={self.current_symbol} "
                     f"T={self.sota.temperature:.3f} "
@@ -196,11 +210,12 @@ class LiveSOTATrader:
                 last_update = now
                 self._bar_counter += 1
 
-                # Skip new-entry scan while we have an open position, BUT
-                # still run in-trade management.
+                # Always manage open positions first
                 positions = self.interface.get_positions() or []
-                if len(positions) > 0:
-                    self._manage_open_positions(positions, dry_run=dry_run)
+                self._manage_open_positions(positions, dry_run=dry_run)
+
+                # Skip new-entry scan ONLY if we are at max capacity
+                if len(positions) >= self.settings.MAX_POSITIONS:
                     continue
 
                 # ----- Fresh scan -------------------------------------------------
@@ -242,12 +257,13 @@ class LiveSOTATrader:
                 if dry_run:
                     continue
 
-                ok = self.interface.send_order(plan.side, plan.lots, plan.sl, plan.tp)
-                if ok:
-                    self._open_tracker = OpenPosition(
+                ticket = self.interface.send_order(plan.side, plan.lots, plan.sl, plan.tp)
+                if ticket:
+                    self._trackers[ticket] = OpenPosition(
                         side=plan.side, entry=plan.entry, sl=plan.sl, tp=plan.tp,
                         entry_bar=self._bar_counter, best_price=plan.entry,
                     )
+                    self._last_order_bar = self._bar_counter
                 time.sleep(2)
 
         except KeyboardInterrupt:
@@ -258,37 +274,51 @@ class LiveSOTATrader:
     # ---- in-trade management ---------------------------------------------
 
     def _manage_open_positions(self, positions, dry_run: bool = False):
-        if self._open_tracker is None:
-            # We were restarted mid-trade; reconstruct minimal tracker from broker
-            p = positions[0]
-            self._open_tracker = OpenPosition(
-                side=+1 if p.type == 0 else -1,
-                entry=float(p.price_open),
-                sl=float(p.sl),
-                tp=float(p.tp),
-                entry_bar=self._bar_counter,
-                best_price=float(p.price_open),
-            )
+        if not positions:
+            self._trackers.clear()
+            return
+
+        active_tickets = [p.ticket for p in positions]
+        # Clean up dead trackers
+        dead = [tid for tid in self._trackers if tid not in active_tickets]
+        for tid in dead:
+            del self._trackers[tid]
+
         target = "XAUUSD" if "XAU" in self.current_symbol else self.current_symbol
-        rates = self.interface.get_rates(count=max(150, self.sota.seq_len + 20),
+        rates = self.interface.get_rates(count=max(200, self.sota.seq_len + 30),
                                          symbol=target)
         if rates is None:
             return
         df = build_live_features(pd.DataFrame(rates), self.sota.features)
 
-        upd = self.planner.manage_open(self._open_tracker, df, self._bar_counter)
-        if upd.close_reason == "time":
-            logger.info("time stop hit -> closing position")
-            if not dry_run:
-                self.interface.close_all()
-            self._open_tracker = None
-            return
-        if upd.new_sl is not None:
-            logger.info(f"SL update -> {upd.new_sl:.2f}")
-            if not dry_run:
-                pos_id = positions[0].ticket
-                self.interface.modify_sl(pos_id, upd.new_sl)
-            self._open_tracker.sl = upd.new_sl
+        for p in positions:
+            tid = p.ticket
+            tracker = self._trackers.get(tid)
+            if tracker is None:
+                # Reconstruct tracker for untracked position
+                tracker = OpenPosition(
+                    side=+1 if p.type == 0 else -1,
+                    entry=float(p.price_open),
+                    sl=float(p.sl),
+                    tp=float(p.tp),
+                    entry_bar=self._bar_counter,
+                    best_price=float(p.price_open),
+                )
+                self._trackers[tid] = tracker
+
+            upd = self.planner.manage_open(tracker, df, self._bar_counter)
+            if upd.close_reason == "time":
+                logger.info(f"Ticket {tid}: time stop hit -> closing")
+                if not dry_run:
+                    self.interface.close_position(tid)
+                del self._trackers[tid]
+                continue
+
+            if upd.new_sl is not None:
+                logger.info(f"Ticket {tid}: SL update -> {upd.new_sl:.2f}")
+                if not dry_run:
+                    self.interface.modify_sl(tid, upd.new_sl)
+                tracker.sl = upd.new_sl
 
 
 # ---------------------------------------------------------------------------
