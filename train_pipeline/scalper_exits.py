@@ -84,17 +84,17 @@ import numpy as np
 @dataclass
 class ScalperConfig:
     # --- Session window (UTC) ---
-    # 20:00 VN = 13:00 UTC; 24:00 VN = 17:00 UTC
-    session_start_utc: int = 13
-    session_end_utc:   int = 17      # exclusive
-    flat_by_minutes_before_close: int = 10  # close everything at 16:50 UTC
-
+    # Defaulting to 24h (00:00–24:00 UTC)
+    session_start_utc: int = 0
+    session_end_utc:   int = 24      # exclusive
+    flat_by_minutes_before_close: int = 0  # 0 = disabled for 24h mode
+ 
     # --- Risk (per trade & per day) ---
-    risk_per_trade:   float = 0.003   # 0.3% per trade (smaller, more frequent)
+    risk_per_trade:   float = 0.003   # 0.3% per trade
     max_risk_frac:    float = 0.005   # hard cap
-    daily_goal_R:     float = 3.0     # stop for the day at +3R realized
+    daily_goal_R:     float = 999999.0 # Effectively removed
     daily_stop_R:     float = 2.0     # stop for the day at -2R realized
-    max_trades_per_day: int = 20
+    max_trades_per_day: int = 1000    # Increased
 
     # --- Entry gating (looser than swing mode) ---
     min_prob_long:    float = 0.52    # lowered from 0.55 — scalper wants frequency
@@ -150,6 +150,7 @@ class ScalpOpen:
     entry_time: datetime
     best_price: float
     initial_lots: float
+    initial_sl_dist: float = 0.0
     tp1_hit: bool = False
     be_moved: bool = False
 
@@ -194,6 +195,8 @@ class ScalperPlanner:
 
     def near_session_close(self, now_utc: datetime) -> bool:
         cfg = self.cfg
+        if cfg.session_end_utc >= 24 and cfg.flat_by_minutes_before_close <= 0:
+            return False
         # e.g. 16:50 UTC or later
         end_h = cfg.session_end_utc
         close_minute = 60 - cfg.flat_by_minutes_before_close

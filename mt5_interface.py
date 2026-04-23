@@ -1,5 +1,6 @@
 import MetaTrader5 as mt5
 import logging
+import time
 from config import Settings
 
 logger = logging.getLogger("FTMO_Trader")
@@ -43,6 +44,15 @@ class MT5Interface:
             return False
             
         logger.info(f"Connected to MT5 - Account: {Settings.MT5_LOGIN}, Server: {Settings.MT5_SERVER}")
+        
+        # Check if Algo Trading is enabled in the terminal
+        term_info = mt5.terminal_info()
+        if term_info is not None:
+            if not term_info.trade_allowed:
+                logger.warning("⚠️ ALGO TRADING IS DISABLED IN MT5 TERMINAL! Please click the 'Algo Trading' button (it should be GREEN).")
+            if not term_info.connected:
+                logger.warning("⚠️ MT5 IS NOT CONNECTED TO THE SERVER!")
+        
         self.authorized = True
         return True
 
@@ -59,6 +69,21 @@ class MT5Interface:
     def get_account_info(self):
         """Returns MT5 account data"""
         return mt5.account_info()
+
+    def get_filling_mode(self):
+        """Detects the supported filling mode for the symbol"""
+        info = mt5.symbol_info(self.symbol)
+        if info is None:
+            return mt5.ORDER_FILLING_FOK
+            
+        filling = info.filling_mode
+        mode = mt5.ORDER_FILLING_FOK
+        if filling & 1: mode = mt5.ORDER_FILLING_FOK
+        elif filling & 2: mode = mt5.ORDER_FILLING_IOC
+        else: mode = mt5.ORDER_FILLING_RETURN
+        
+        logger.info(f"Detected filling mode: {mode} (raw: {filling})")
+        return mode
 
     def get_positions(self):
         """Returns open positions for the current symbol"""
@@ -83,26 +108,32 @@ class MT5Interface:
         return ticks
 
     def send_order(self, signal, volume, sl=0.0, tp=0.0):
-        """Sends a market order via MT5 with optional SL and TP"""
+        """Sends a market order via MT5 with high deviation to avoid timeouts."""
         if signal == 0:
             return None
             
         order_type = mt5.ORDER_TYPE_BUY if signal > 0 else mt5.ORDER_TYPE_SELL
-        price = mt5.symbol_info_tick(self.symbol).ask if signal > 0 else mt5.symbol_info_tick(self.symbol).bid
         
-        # Build request
+        # Get the absolute latest price right before sending
+        tick = mt5.symbol_info_tick(self.symbol)
+        if tick is None:
+            logger.error(f"Could not get tick for {self.symbol}")
+            return None
+            
+        price = tick.ask if signal > 0 else tick.bid
+        
+        # Build initial request
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": self.symbol,
             "volume": float(volume),
             "type": order_type,
-            "price": price,
-            "sl": float(sl) if sl > 0 else 0.0,
-            "tp": float(tp) if tp > 0 else 0.0,
+            "price": price, 
             "magic": 123456,
+            "deviation": 500, # ALLOW MASSIVE SLIPPAGE (500 points)
             "comment": "AI-XAUUSD-FTMO",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": self.get_filling_mode(), 
         }
         
         # Send
@@ -112,7 +143,16 @@ class MT5Interface:
             logger.error(f"Order failed, retcode={error_code}")
             return None
             
-        logger.info(f"ORDER PLACED: {'BUY' if signal > 0 else 'SELL'} {volume} lot(s) at {price} | SL: {sl} | TP: {tp}")
+        ticket = result.order
+        logger.info(f"ORDER OPENED: {'BUY' if signal > 0 else 'SELL'} {volume} lot(s) at {result.price} (Ticket: {ticket})")
+        
+        # Step 2: Attach SL/TP (Small delay to ensure broker has registered the position)
+        if sl > 0 or tp > 0:
+            time.sleep(0.2) # Give the broker a moment
+            success = self.modify_position(ticket, sl, tp)
+            if not success:
+                logger.warning(f"Failed to attach SL/TP to ticket {ticket} on first attempt. Bot will try to fix it in the next loop.")
+            
         return result
 
     def modify_position(self, ticket, sl, tp):
@@ -147,7 +187,7 @@ class MT5Interface:
                     "magic": 123456,
                     "comment": "Bot Exit",
                     "type_time": mt5.ORDER_TIME_GTC,
-                    "type_filling": mt5.ORDER_FILLING_IOC,
+                    "type_filling": self.get_filling_mode(),
                 }
                 result = mt5.order_send(request)
                 if result.retcode == mt5.TRADE_RETCODE_DONE:
@@ -176,7 +216,7 @@ class MT5Interface:
                     "magic": 123456,
                     "comment": "Partial Exit",
                     "type_time": mt5.ORDER_TIME_GTC,
-                    "type_filling": mt5.ORDER_FILLING_IOC,
+                    "type_filling": self.get_filling_mode(),
                 }
                 result = mt5.order_send(request)
                 if result.retcode == mt5.TRADE_RETCODE_DONE:

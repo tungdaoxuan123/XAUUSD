@@ -37,8 +37,8 @@ class Settings:
     # Paths
     ENSEMBLE_MODEL_PATH = os.getenv("ENSEMBLE_MODEL_PATH", "train_pipeline/models_dukas_300b/")
     # SOTA Model
-    SOTA_MODEL_PATH = os.getenv("SOTA_MODEL_PATH", "train_pipeline/models_sota_v2/checkpoint.pt")
-    SOTA_CONFIG_PATH = os.getenv("SOTA_CONFIG_PATH", "train_pipeline/models_sota_v2/sota_config.json")
+    SOTA_MODEL_PATH = os.getenv("SOTA_MODEL_PATH", "train_pipeline/models_sota/patchtst_primary.pt")
+    SOTA_CONFIG_PATH = os.getenv("SOTA_CONFIG_PATH", "train_pipeline/models_sota/sota_config.json")
     SOTA_DEVICE = "cpu"  # DirectML doesn't support TransformerEncoderLayer logic accurately
     LOG_FILE = "ftmo_trading.log"
 

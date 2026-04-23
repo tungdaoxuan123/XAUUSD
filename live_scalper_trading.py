@@ -1,20 +1,20 @@
 """
 live_scalper_trading.py
 =======================
-High-frequency variant of live_sota_trading.py tuned for the 20:00–24:00
-Vietnam session (= 13:00–17:00 UTC, London-NY overlap on XAUUSD).
+High-frequency variant of live_sota_trading.py designed for scalp-style
+trading. Defaulted to 24h trading, but can be restricted to specific sessions.
 
 Goal: many small wins, not one big swing.
 
 Differences vs live_sota_trading.py
 -----------------------------------
   * Uses ScalperPlanner (tight SL ~1.1*ATR, TP1 +0.5R partial, TP2 +1.2R)
-  * Hard session window 13:00–17:00 UTC
+  * Default 24h window (can be restricted via --session-start-utc)
   * Daily goal/stop: stop trading at +3R or -2R realized
   * Cooldown after each close (3 bars)
   * Max 20 trades per day
   * Partial close at TP1 (50% of size) + move SL to BE
-  * Flat-by-close 10 minutes before session end (no overnight risk)
+  * Flat-by-close support (if session end is set)
   * Slightly looser min_prob (0.52) because scalper wants volume;
     edge comes from risk mgmt, not prob threshold.
 
@@ -73,7 +73,19 @@ class CalibratedSignal:
         self.device = device if "privateuseone" not in str(device) else "cpu"
 
         logger.info(f"Loading SOTA model: {model_path}  T={self.temperature:.3f}")
-        ckpt = torch.load(model_path, map_location="cpu")
+        # Nuclear Option: Monkey-patch the internal rebuilder to ignore DirectML devices
+        import torch._utils
+        orig_rebuild = torch._utils._rebuild_device_tensor_from_numpy
+        def patched_rebuild(data, dtype, device, *args):
+            # args[0] might be requires_grad in some torch versions
+            return orig_rebuild(data, dtype, torch.device('cpu'), *args)
+        
+        try:
+            torch._utils._rebuild_device_tensor_from_numpy = patched_rebuild
+            ckpt = torch.load(model_path, map_location='cpu')
+        finally:
+            torch._utils._rebuild_device_tensor_from_numpy = orig_rebuild
+
         self.model = PatchTSTLite(
             n_features=ckpt["n_features"],
             seq_len=ckpt["seq_len"],
