@@ -64,6 +64,7 @@ import json
 import logging
 import os
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
@@ -520,6 +521,8 @@ def main():
     if args.gpu and HAS_TORCH:
         if torch.cuda.is_available():
             device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
         else:
             try:
                 import torch_directml

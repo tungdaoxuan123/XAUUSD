@@ -154,7 +154,7 @@ def load_data(csv_path: str) -> pd.DataFrame:
     if missing:
         logger.error(f"Missing columns: {missing}")
         sys.exit(1)
-    df["time"] = pd.to_datetime(df["time"], infer_datetime_format=True)
+    df["time"] = pd.to_datetime(df["time"])
     df = df.sort_values("time").reset_index(drop=True)
     logger.info(f"Loaded {len(df):,} rows | {df['time'].iloc[0]} -> {df['time'].iloc[-1]}")
     return df
@@ -660,6 +660,7 @@ def parse_args():
     parser.add_argument("--lookback",          type=int,   default=10)
     parser.add_argument("--buy-threshold",     type=float, default=0.0005)
     parser.add_argument("--sell-threshold",    type=float, default=0.0005)
+    parser.add_argument("--label-col",         type=str,   default=None, help="Use existing label column from CSV")
     parser.add_argument("--expanded-features", action="store_true")
     parser.add_argument("--microstructure-features", action="store_true", help="Include microstructure columns if present in data")
     parser.add_argument("--use-gpu",           action="store_true")
@@ -679,10 +680,13 @@ def main():
     logger.info("  XAUUSD GPU Ensemble Training (LightGBM + AMD OpenCL)")
     logger.info("=" * 65)
     logger.info(f"  Data          : {args.data}")
-    logger.info(f"  Horizon       : {args.horizon} bars")
+    if args.label_col:
+        logger.info(f"  Label Column  : {args.label_col}")
+    else:
+        logger.info(f"  Horizon       : {args.horizon} bars")
+        logger.info(f"  Buy threshold : {args.buy_threshold:.4%}")
+        logger.info(f"  Sell threshold: {args.sell_threshold:.4%}")
     logger.info(f"  Lookback      : {args.lookback} bars")
-    logger.info(f"  Buy threshold : {args.buy_threshold:.4%}")
-    logger.info(f"  Sell threshold: {args.sell_threshold:.4%}")
     logger.info(f"  Features      : {suffix}")
     logger.info(f"  GPU requested : {args.use_gpu}")
     logger.info(f"  GPU backend   : {args.gpu_backend}")
@@ -705,8 +709,13 @@ def main():
     feature_names = list(X.columns)
     logger.info(f"Features: {len(feature_names)} | {feature_names[:15]}...")
 
-    logger.info("Building labels...")
-    y = build_labels(df, lookback=args.lookback, horizon=args.horizon, buy_threshold=args.buy_threshold, sell_threshold=args.sell_threshold)
+    if args.label_col:
+        logger.info(f"Using existing labels from column: {args.label_col}")
+        # Need to align labels with feature matrix shift (lookback-1)
+        y = df[args.label_col].iloc[args.lookback - 1:].reset_index(drop=True)
+    else:
+        logger.info("Building labels...")
+        y = build_labels(df, lookback=args.lookback, horizon=args.horizon, buy_threshold=args.buy_threshold, sell_threshold=args.sell_threshold)
     
     valid_mask = y.notna()
     X = X[valid_mask].reset_index(drop=True)
