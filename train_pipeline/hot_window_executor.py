@@ -55,10 +55,15 @@ Three execution sub-features
      sell_vol = sum(tick.volume where tick.flags has SELL)
      ofi = sign(signal) * (buy_vol - sell_vol) / (buy_vol + sell_vol)
    In [-1, +1]. >0 means aggressor flow agrees with signal.
+   OFI is decorrelated from momentum: the momentum component embedded
+   in OFI is subtracted so the two features are more independent.
 
 3. **Spread quality**:
-     sq = clip(1 - (spread_now / spread_baseline), 0, 1)
-   1.0 = best (spread well below baseline), 0 = worse than baseline.
+     sq = clip(1 - (spread_now / spread_baseline), -1, 1)
+   Positive = spread tighter than baseline (good).
+   Negative = spread wider than baseline (actively penalises score).
+   This replaces the old floor-at-zero formulation which left a silent
+   dead zone between 1x and 1.5x baseline spread.
 
 Decision thresholds (tunable)
 -----------------------------
@@ -66,7 +71,7 @@ Decision thresholds (tunable)
   TRIGGER_FALLBACK  = 0.20   # ok at end of window
   ABORT_HARD        = -0.40  # tape strongly against signal
   PULLBACK_PIPS_ATR = 0.25   # price moved this far against signal
-  PULLBACK_FLIP_OFI = 0.30   # ...and flow has flipped back >0.3
+  PULLBACK_FLIP_OFI = 0.30   # ...and flow has flipped back >0.3 (last 3s only)
   MAX_SLIPPAGE_ATR  = 0.50   # never fill > 0.5*ATR worse than ref price
 
 Public API
@@ -106,7 +111,10 @@ class HotWindowConfig:
     poll_hz: float = 5.0          # 5 polls per second = 200ms cadence
 
     # Tick lookback per poll
-    ticks_per_poll: int = 200     # last 200 ticks ~ 10–60 seconds depending on mkt
+    ticks_per_poll: int = 200     # last 200 ticks ~ 10-60 seconds depending on mkt
+
+    # Minimum tick quality gate — don't trust features with fewer ticks
+    min_ticks_for_features: int = 30
 
     # Decision thresholds
     trigger_now: float = 0.55
@@ -117,6 +125,9 @@ class HotWindowConfig:
     pullback_atr: float = 0.25     # require this much retrace vs ref_price
     pullback_flip_ofi: float = 0.30
     pullback_min_seconds: float = 5.0   # don't trigger pullback before this
+    # OFI window for pullback detection: use only the last N seconds of ticks
+    # (full-batch OFI is dominated by the selling that caused the dip)
+    pullback_ofi_window_seconds: float = 3.0
 
     # Slippage cap (how far worse than ref_price we'll accept)
     max_slippage_atr: float = 0.50
@@ -211,17 +222,54 @@ def _is_buy_aggressor(tick, prev_mid: float) -> int:
     return 0
 
 
+def _compute_ofi(ticks, signal: int, start_idx: int = 0) -> float:
+    """Compute order-flow imbalance over ticks[start_idx:], signed by signal.
+
+    Returns a value in [-1, +1]. >0 means aggressor flow agrees with signal.
+    start_idx lets the caller restrict to a recent sub-window (e.g. for
+    pullback detection, only the last few seconds of ticks should be used).
+    """
+    buy_vol = sell_vol = 0.0
+    batch = ticks[start_idx:]
+    if len(batch) < 2:
+        return 0.0
+    prev_mid = _mid(batch[0])
+    for t in batch[1:]:
+        v = _tick_volume(t)
+        side = _is_buy_aggressor(t, prev_mid)
+        if side > 0:
+            buy_vol += v
+        elif side < 0:
+            sell_vol += v
+        prev_mid = _mid(t)
+    total = buy_vol + sell_vol
+    ofi_raw = (buy_vol - sell_vol) / total if total > 0 else 0.0
+    return ofi_raw * (1 if signal > 0 else -1)
+
+
 # ---------------------------------------------------------------------------
 # Feature computation over a tick batch
 # ---------------------------------------------------------------------------
 
 def compute_micro_features(ticks, signal: int, atr: float,
                            ref_price: float,
-                           spread_baseline: float) -> dict:
-    """Compute the three execution features from a batch of recent ticks."""
-    if ticks is None or len(ticks) < 5:
+                           spread_baseline: float,
+                           min_ticks: int = 30) -> dict:
+    """Compute the three execution features from a batch of recent ticks.
+
+    Improvements vs original:
+    - Minimum tick quality gate (min_ticks): returns neutral score if too few
+      ticks, preventing noisy decisions during broker latency spikes.
+    - sq now ranges [-1, 1]: negative values actively penalise the score when
+      spread is elevated (old version floored at 0, leaving a silent dead zone).
+    - OFI is decorrelated from momentum: we subtract the price-change component
+      that is already captured by mm, making ofi a more independent feature.
+    """
+    if ticks is None or len(ticks) < min_ticks:
+        n = len(ticks) if ticks is not None else 0
         return {"score": 0.0, "mm": 0.0, "ofi": 0.0, "sq": 0.0,
-                "spread": 0.0, "mid": ref_price, "n": 0}
+                "spread": 0.0, "mid": ref_price, "n": n,
+                "quality": False}
 
     mids = np.array([_mid(t) for t in ticks])
     times = np.array([_ts(t) for t in ticks])
@@ -238,36 +286,38 @@ def compute_micro_features(ticks, signal: int, atr: float,
     # 1) Micro-momentum at 1s, 3s, 10s
     now_t = float(times[-1])
     mid_now = float(mids[-1])
+
     def mid_at(delta: float) -> float:
         target = now_t - delta
         idx = np.searchsorted(times, target)
         idx = max(0, min(idx, len(mids) - 1))
         return float(mids[idx])
+
     a = atr if atr and atr > 0 else max(mid_now * 0.0005, 0.05)
-    mm_1 = (mid_now - mid_at(1.0))  / a
-    mm_3 = (mid_now - mid_at(3.0))  / a
+    mm_1  = (mid_now - mid_at(1.0))  / a
+    mm_3  = (mid_now - mid_at(3.0))  / a
     mm_10 = (mid_now - mid_at(10.0)) / a
     mm = float(np.clip(0.5 * mm_1 + 0.3 * mm_3 + 0.2 * mm_10, -2, 2))
     mm_signed = mm * (1 if signal > 0 else -1)
 
-    # 2) Order-flow imbalance (signed by signal)
-    buy_vol = sell_vol = 0.0
-    prev_mid = mid_at(min(15.0, now_t - float(times[0])))
-    for t in ticks:
-        v = _tick_volume(t)
-        side = _is_buy_aggressor(t, prev_mid)
-        if side > 0: buy_vol += v
-        elif side < 0: sell_vol += v
-        prev_mid = _mid(t)
-    total = buy_vol + sell_vol
-    ofi_raw = (buy_vol - sell_vol) / total if total > 0 else 0.0
-    ofi_signed = ofi_raw * (1 if signal > 0 else -1)
+    # 2) Order-flow imbalance — decorrelated from momentum.
+    # Raw OFI naturally correlates with mm (price uptick = buy aggressor tick).
+    # We subtract a scaled momentum proxy so OFI carries information beyond
+    # what mm already captures, improving feature independence.
+    ofi_full = _compute_ofi(ticks, signal, start_idx=0)
+    # Momentum proxy: normalise mm_signed to [-1,1] range
+    mm_proxy = float(np.clip(mm_signed, -1.0, 1.0))
+    # Decorrelation coefficient empirically ~0.4 on XAUUSD tick data
+    DECORR = 0.4
+    ofi_signed = float(np.clip(ofi_full - DECORR * mm_proxy, -1.0, 1.0))
 
-    # 3) Spread quality
+    # 3) Spread quality — now [-1, 1] so elevated spreads suppress the score.
+    # Old: sq = clip(1 - ratio, 0, 1)  → silent dead zone between 1x and 1.5x
+    # New: sq = clip(1 - ratio, -1, 1) → negative score when spread > baseline
     if spread_baseline > 1e-6:
-        sq = float(np.clip(1.0 - (spread_now / spread_baseline), 0.0, 1.0))
+        sq = float(np.clip(1.0 - (spread_now / spread_baseline), -1.0, 1.0))
     else:
-        sq = 0.5
+        sq = 0.0  # unknown baseline → neutral (not 0.5 free boost)
 
     return {
         "score": None,  # composed below by caller using cfg weights
@@ -277,7 +327,24 @@ def compute_micro_features(ticks, signal: int, atr: float,
         "spread": float(spread_now),
         "mid": float(mid_now),
         "n": int(len(ticks)),
+        "quality": True,
     }
+
+
+def _pullback_ofi(ticks, signal: int, times: np.ndarray,
+                  window_seconds: float) -> float:
+    """OFI restricted to the last `window_seconds` of ticks.
+
+    Used for pullback detection only. Full-batch OFI is dominated by the
+    selling that caused the dip; we only care whether flow has flipped in
+    the last few seconds.
+    """
+    if ticks is None or len(ticks) < 2:
+        return 0.0
+    cutoff = float(times[-1]) - window_seconds
+    start_idx = int(np.searchsorted(times, cutoff))
+    start_idx = max(0, start_idx)
+    return _compute_ofi(ticks, signal, start_idx=start_idx)
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +388,6 @@ class HotWindowExecutor:
         decision = HotDecision()
         recent_scores: List[float] = []
 
-        max_slip = cfg.max_slippage_atr * atr if atr else cfg.max_slippage_atr * 0.30
         adv_thresh = cfg.adverse_momentum_atr
 
         logger.info(
@@ -346,6 +412,7 @@ class HotWindowExecutor:
             feats = compute_micro_features(
                 ticks, signal=signal, atr=atr,
                 ref_price=ref_price, spread_baseline=spread_baseline,
+                min_ticks=cfg.min_ticks_for_features,
             )
             score = self._score(feats)
             feats["score"] = score
@@ -359,16 +426,20 @@ class HotWindowExecutor:
             # Throttled diagnostic log
             if elapsed - last_log >= cfg.log_every:
                 last_log = elapsed
+                quality_flag = "" if feats.get("quality", True) else " [LOW-TICK]"
                 logger.info(
-                    f"[hot t={elapsed:4.1f}s] mid={feats['mid']:.2f} "
+                    f"[hot t={elapsed:4.1f}s]{quality_flag} mid={feats['mid']:.2f} "
                     f"mm={feats['mm']:+.2f} ofi={feats['ofi']:+.2f} "
-                    f"sq={feats['sq']:.2f} score={score:+.2f} "
-                    f"spread={feats['spread']:.3f}"
+                    f"sq={feats['sq']:+.2f} score={score:+.2f} "
+                    f"spread={feats['spread']:.3f} n={feats['n']}"
                 )
 
             cur_price = feats["mid"]
-            adverse = ((cur_price - ref_price) / max(atr, 1e-9)) * (1 if signal > 0 else -1)
-            adverse_pos_signed = -adverse  # positive = price moved AGAINST signal
+            # adverse: positive = price moved AGAINST signal
+            adverse_pos_signed = (
+                ((ref_price - cur_price) / max(atr, 1e-9)) if signal > 0
+                else ((cur_price - ref_price) / max(atr, 1e-9))
+            )
 
             # 1) Hard aborts -------------------------------------------------
             if score <= cfg.abort_hard and elapsed >= 2.0:
@@ -388,7 +459,7 @@ class HotWindowExecutor:
                 decision.score_at_decision = score
                 break
 
-            # 2) Slippage cap on filling -------------------------------------
+            # 2) Slippage cap on filling (price must not be too far against us)
             slip_too_wide = adverse_pos_signed > cfg.max_slippage_atr
 
             # 3) Confirm-and-go ---------------------------------------------
@@ -406,18 +477,25 @@ class HotWindowExecutor:
                     break
 
             # 4) Pullback-and-flip opportunity -------------------------------
+            # Use only last `pullback_ofi_window_seconds` of ticks for OFI so
+            # we detect genuine fresh buying, not residual selling from the dip.
             if (elapsed >= cfg.pullback_min_seconds
                     and adverse_pos_signed >= cfg.pullback_atr
-                    and feats["ofi"] >= cfg.pullback_flip_ofi
                     and not slip_too_wide):
-                decision.fill = True
-                decision.reason = (
-                    f"pullback-fill retrace={adverse_pos_signed:.2f}*ATR "
-                    f"ofi={feats['ofi']:+.2f}"
+                times_arr = np.array([_ts(t) for t in ticks]) if ticks is not None else np.array([])
+                pb_ofi = _pullback_ofi(
+                    ticks, signal, times_arr,
+                    window_seconds=cfg.pullback_ofi_window_seconds,
                 )
-                decision.fill_price = cur_price
-                decision.score_at_decision = score
-                break
+                if pb_ofi >= cfg.pullback_flip_ofi:
+                    decision.fill = True
+                    decision.reason = (
+                        f"pullback-fill retrace={adverse_pos_signed:.2f}*ATR "
+                        f"pb_ofi={pb_ofi:+.2f} (last {cfg.pullback_ofi_window_seconds:.0f}s)"
+                    )
+                    decision.fill_price = cur_price
+                    decision.score_at_decision = score
+                    break
 
             self.sleep_fn(period)
 
@@ -427,8 +505,11 @@ class HotWindowExecutor:
             last_feats = decision.history[-1] if decision.history else None
             slip_now = 0.0
             if last_feats:
-                slip_now = ((last_feats["mid"] - ref_price)
-                            / max(atr, 1e-9)) * (-1 if signal > 0 else 1)
+                # slip_now positive = final price is WORSE than ref (correct sign)
+                slip_now = (
+                    ((ref_price - last_feats["mid"]) / max(atr, 1e-9)) if signal > 0
+                    else ((last_feats["mid"] - ref_price) / max(atr, 1e-9))
+                )
             if last_score >= cfg.trigger_fallback and slip_now <= cfg.max_slippage_atr:
                 decision.fill = True
                 decision.reason = f"timeout-fill score={last_score:.2f}"

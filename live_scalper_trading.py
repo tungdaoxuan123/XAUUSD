@@ -175,12 +175,33 @@ class LiveScalper:
             return float(getattr(self.settings, "INITIAL_BALANCE", 10000.0))
 
     def _spread(self) -> float:
+        """Raw live ask-bid spread from broker (never from the AI dataframe)."""
         try:
             ticks = self.interface.get_ticks(count=1)
             if ticks is None or len(ticks) == 0:
                 return 0.0
             t = ticks[-1]
             return float(t["ask"] - t["bid"]) if hasattr(t, "__getitem__") else float(t.ask - t.bid)
+        except Exception:
+            return 0.0
+
+    def _live_mid(self) -> float:
+        """Current live mid-price polled directly from broker ticks.
+
+        Used as ref_price for the hot window so slippage is measured
+        relative to *now*, not the stale bar-close from up to 10s ago.
+        Falls back to 0.0 on error (caller must handle 0.0 as invalid).
+        """
+        try:
+            ticks = self.interface.get_ticks(count=1)
+            if ticks is None or len(ticks) == 0:
+                return 0.0
+            t = ticks[-1]
+            bid = float(t["bid"]) if hasattr(t, "__getitem__") else float(t.bid)
+            ask = float(t["ask"]) if hasattr(t, "__getitem__") else float(t.ask)
+            if bid > 0 and ask > 0:
+                return 0.5 * (bid + ask)
+            return 0.0
         except Exception:
             return 0.0
 
@@ -272,13 +293,31 @@ class LiveScalper:
                 fill_price = plan.entry
                 if self.use_hot_window:
                     atr_val = float(df["ATR"].iloc[-1]) if "ATR" in df.columns else plan.sl_dist / 1.1
-                    spread_baseline = (
-                        float(df["spread_mean"].iloc[-5:].mean())
-                        if "spread_mean" in df.columns else max(self._spread(), 0.05)
+
+                    # FIX: always use raw broker spread — the AI dataframe is
+                    # normalized so df["spread_mean"] is ~0.0, which makes any
+                    # real spread look infinitely wide and aborts every trade.
+                    live_spread = self._spread()
+                    spread_baseline = max(live_spread, 0.05)
+
+                    # FIX: use live mid as ref_price, NOT plan.entry.
+                    # plan.entry is the bar-close from up to 10s ago; on fast
+                    # XAUUSD moves price may already be 15-20 pts in our favour
+                    # by the time the hot window opens. A stale ref causes the
+                    # slippage check to register that move as adverse slippage,
+                    # blocking every fill. Anchoring to the live mid fixes this.
+                    live_ref = self._live_mid()
+                    ref_price = live_ref if live_ref > 0 else plan.entry
+
+                    logger.info(
+                        f"hot window ref={ref_price:.2f} "
+                        f"(plan.entry={plan.entry:.2f} drift={ref_price - plan.entry:+.2f}) "
+                        f"spread_baseline={spread_baseline:.3f}"
                     )
+
                     decision = self.hot_executor.run(
                         signal=plan.side,
-                        ref_price=plan.entry,
+                        ref_price=ref_price,
                         atr=atr_val,
                         spread_baseline=spread_baseline,
                     )
@@ -287,7 +326,7 @@ class LiveScalper:
                         # Cooldown anyway so we don't immediately re-trigger
                         self.planner.day.last_close_bar = self.bar_counter
                         continue
-                    fill_price = decision.fill_price or plan.entry
+                    fill_price = decision.fill_price or ref_price
                     # Re-anchor SL/TPs to actual fill price (preserves R distances)
                     sl_dist = plan.sl_dist
                     if plan.side > 0:
