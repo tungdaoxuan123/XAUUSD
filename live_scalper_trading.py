@@ -54,6 +54,9 @@ from train_pipeline.live_features import build_live_features
 from train_pipeline.scalper_exits import (
     ScalperPlanner, ScalperConfig, ScalpOpen,
 )
+from train_pipeline.hot_window_executor import (
+    HotWindowExecutor, HotWindowConfig,
+)
 
 logger = setup_logging()
 
@@ -126,7 +129,9 @@ class CalibratedSignal:
 
 class LiveScalper:
     def __init__(self, model_path=None, config_path=None, device=None,
-                 scalp_cfg: Optional[ScalperConfig] = None):
+                 scalp_cfg: Optional[ScalperConfig] = None,
+                 hot_cfg: Optional[HotWindowConfig] = None,
+                 use_hot_window: bool = True):
         self.settings = Settings
         self.interface = MT5Interface()
         self.risk_mgr = FTMORiskManager(self.interface)
@@ -142,6 +147,13 @@ class LiveScalper:
         self.planner = ScalperPlanner(scalp_cfg or ScalperConfig())
         self.pos: Optional[ScalpOpen] = None
         self.bar_counter = 0
+
+        # Hot-window executor (tick-level entry timing)
+        self.use_hot_window = use_hot_window
+        self.hot_executor = HotWindowExecutor(
+            cfg=hot_cfg or HotWindowConfig(),
+            tick_source=self.interface.get_ticks,
+        )
 
         cfg = self.planner.cfg
         logger.info(
@@ -255,6 +267,44 @@ class LiveScalper:
                     f"sl={plan.sl:.2f} tp1={plan.tp1:.2f} tp2={plan.tp2:.2f} "
                     f"risk={plan.equity_risk*100:.2f}%"
                 )
+
+                # ---- 6) Hot-window tick-level entry timing ----
+                fill_price = plan.entry
+                if self.use_hot_window:
+                    atr_val = float(df["ATR"].iloc[-1]) if "ATR" in df.columns else plan.sl_dist / 1.1
+                    spread_baseline = (
+                        float(df["spread_mean"].iloc[-5:].mean())
+                        if "spread_mean" in df.columns else max(self._spread(), 0.05)
+                    )
+                    decision = self.hot_executor.run(
+                        signal=plan.side,
+                        ref_price=plan.entry,
+                        atr=atr_val,
+                        spread_baseline=spread_baseline,
+                    )
+                    if not decision.fill:
+                        logger.info(f"hot window skipped trade: {decision.reason}")
+                        # Cooldown anyway so we don't immediately re-trigger
+                        self.planner.day.last_close_bar = self.bar_counter
+                        continue
+                    fill_price = decision.fill_price or plan.entry
+                    # Re-anchor SL/TPs to actual fill price (preserves R distances)
+                    sl_dist = plan.sl_dist
+                    if plan.side > 0:
+                        plan.sl  = fill_price - sl_dist
+                        plan.tp1 = fill_price + self.planner.cfg.rr_partial * sl_dist
+                        plan.tp2 = fill_price + self.planner.cfg.rr_final   * sl_dist
+                    else:
+                        plan.sl  = fill_price + sl_dist
+                        plan.tp1 = fill_price - self.planner.cfg.rr_partial * sl_dist
+                        plan.tp2 = fill_price - self.planner.cfg.rr_final   * sl_dist
+                    plan.entry = fill_price
+                    logger.info(
+                        f"hot fill @ {fill_price:.2f} "
+                        f"({decision.reason}, {decision.elapsed_seconds:.1f}s, "
+                        f"{decision.samples} samples)"
+                    )
+
                 if dry_run:
                     self.planner.record_open(now_utc)
                     continue
@@ -370,6 +420,13 @@ def main():
     ap.add_argument("--stop-r", type=float, default=None)
     ap.add_argument("--session-start-utc", type=int, default=None)
     ap.add_argument("--session-end-utc", type=int, default=None)
+    # Hot-window tuning
+    ap.add_argument("--no-hot-window", action="store_true",
+                    help="Disable tick-level entry timing (instant market in)")
+    ap.add_argument("--hot-seconds", type=float, default=None)
+    ap.add_argument("--hot-trigger-now", type=float, default=None)
+    ap.add_argument("--hot-trigger-fb", type=float, default=None)
+    ap.add_argument("--hot-abort", type=float, default=None)
     args = ap.parse_args()
 
     cfg = ScalperConfig()
@@ -384,7 +441,16 @@ def main():
     if args.session_start_utc is not None: cfg.session_start_utc = args.session_start_utc
     if args.session_end_utc is not None:   cfg.session_end_utc = args.session_end_utc
 
-    LiveScalper(device=args.device, scalp_cfg=cfg).run(dry_run=args.dry_run)
+    hot_cfg = HotWindowConfig()
+    if args.hot_seconds is not None:     hot_cfg.window_seconds = args.hot_seconds
+    if args.hot_trigger_now is not None: hot_cfg.trigger_now = args.hot_trigger_now
+    if args.hot_trigger_fb is not None:  hot_cfg.trigger_fallback = args.hot_trigger_fb
+    if args.hot_abort is not None:       hot_cfg.abort_hard = args.hot_abort
+
+    LiveScalper(
+        device=args.device, scalp_cfg=cfg, hot_cfg=hot_cfg,
+        use_hot_window=not args.no_hot_window,
+    ).run(dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
