@@ -74,6 +74,20 @@ Decision thresholds (tunable)
   PULLBACK_FLIP_OFI = 0.30   # ...and flow has flipped back >0.3 (last 3s only)
   MAX_SLIPPAGE_ATR  = 0.50   # never fill > 0.5*ATR worse than ref price
 
+Sign conventions (CRITICAL — two distinct concepts)
+----------------------------------------------------
+  adverse_pos_signed  = (ref - cur) / atr  for BUY  [momentum]
+      Positive = price dropped below ref = market moving AGAINST signal.
+      Used for: hard abort on broken signal, pullback detection gate.
+
+  exec_slip / slip_now = (cur - ref) / atr  for BUY  [execution slippage]
+      Positive = price rose above ref = you are CHASING a worse entry.
+      Used for: slip_too_wide gate, timeout fill gate.
+      Negative = price dropped below ref = you get a BETTER (cheaper) entry.
+
+These two concepts have opposite signs for the same price move.
+Never reuse the same variable for both.
+
 Public API
 ----------
     cfg = HotWindowConfig()
@@ -435,10 +449,23 @@ class HotWindowExecutor:
                 )
 
             cur_price = feats["mid"]
-            # adverse: positive = price moved AGAINST signal
+
+            # Adverse momentum: positive = price moved AGAINST signal direction.
+            #   BUY:  ref - cur  (positive when cur < ref, i.e. price dropped)
+            #   SELL: cur - ref  (positive when cur > ref, i.e. price rose)
+            # Used for: hard abort on broken signal, pullback detection gate.
             adverse_pos_signed = (
                 ((ref_price - cur_price) / max(atr, 1e-9)) if signal > 0
                 else ((cur_price - ref_price) / max(atr, 1e-9))
+            )
+
+            # Execution slippage: positive = fill price is WORSE than ref.
+            #   BUY:  cur - ref  (positive when cur > ref, i.e. price rose = chasing)
+            #   SELL: ref - cur  (positive when cur < ref, i.e. price fell = underselling)
+            # Used for: slip_too_wide gate (blocks chasing, allows pullback entries).
+            exec_slip = (
+                ((cur_price - ref_price) / max(atr, 1e-9)) if signal > 0
+                else ((ref_price - cur_price) / max(atr, 1e-9))
             )
 
             # 1) Hard aborts -------------------------------------------------
@@ -459,8 +486,10 @@ class HotWindowExecutor:
                 decision.score_at_decision = score
                 break
 
-            # 2) Slippage cap on filling (price must not be too far against us)
-            slip_too_wide = adverse_pos_signed > cfg.max_slippage_atr
+            # 2) Slippage cap: block if we are chasing too far above ref (BUY)
+            #    or selling too far below ref (SELL). Pullback entries (negative
+            #    exec_slip) are explicitly allowed — they improve fill price.
+            slip_too_wide = exec_slip > cfg.max_slippage_atr
 
             # 3) Confirm-and-go ---------------------------------------------
             if score >= cfg.trigger_now and not slip_too_wide:
@@ -477,8 +506,11 @@ class HotWindowExecutor:
                     break
 
             # 4) Pullback-and-flip opportunity -------------------------------
-            # Use only last `pullback_ofi_window_seconds` of ticks for OFI so
-            # we detect genuine fresh buying, not residual selling from the dip.
+            # adverse_pos_signed >= pullback_atr: price has retraced enough
+            # against signal to be a meaningful dip (not chasing — momentum
+            # abort would have fired if it were a full signal failure).
+            # slip_too_wide is False here because exec_slip = -adverse for BUY,
+            # so a price drop always gives negative exec_slip (better entry).
             if (elapsed >= cfg.pullback_min_seconds
                     and adverse_pos_signed >= cfg.pullback_atr
                     and not slip_too_wide):
@@ -505,20 +537,23 @@ class HotWindowExecutor:
             last_feats = decision.history[-1] if decision.history else None
             slip_now = 0.0
             if last_feats:
-                # slip_now positive = final price is WORSE than ref (correct sign)
+                # slip_now positive = fill price is WORSE than ref (chasing).
+                #   BUY:  mid - ref  (positive = price rose = expensive entry)
+                #   SELL: ref - mid  (positive = price fell = underselling)
+                # Negative slip_now = better-than-ref entry (pullback) — always allowed.
                 slip_now = (
-                    ((ref_price - last_feats["mid"]) / max(atr, 1e-9)) if signal > 0
-                    else ((last_feats["mid"] - ref_price) / max(atr, 1e-9))
+                    ((last_feats["mid"] - ref_price) / max(atr, 1e-9)) if signal > 0
+                    else ((ref_price - last_feats["mid"]) / max(atr, 1e-9))
                 )
             if last_score >= cfg.trigger_fallback and slip_now <= cfg.max_slippage_atr:
                 decision.fill = True
-                decision.reason = f"timeout-fill score={last_score:.2f}"
+                decision.reason = f"timeout-fill score={last_score:.2f} slip={slip_now:+.2f}*ATR"
                 decision.fill_price = last_feats["mid"] if last_feats else ref_price
                 decision.score_at_decision = last_score
             else:
                 decision.reason = (
                     f"timeout-skip score={last_score:.2f} "
-                    f"slip={slip_now:.2f}*ATR"
+                    f"slip={slip_now:+.2f}*ATR"
                 )
                 decision.score_at_decision = last_score
 
