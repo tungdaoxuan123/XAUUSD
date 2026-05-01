@@ -57,11 +57,15 @@ class MT5Interface:
         return True
 
     def find_actual_symbol(self):
-        """Searches for XAUUSD or BTCUSD variants in Market Watch"""
+        """Searches for variants in Market Watch based on the base symbol"""
         symbols = mt5.symbols_get()
-        target = "XAUUSD" if "XAU" in self.symbol.upper() else "BTCUSD"
+        if not symbols:
+            logger.error("Failed to get MT5 symbols")
+            return None
+            
+        base_symbol = self.symbol[:6].upper() if len(self.symbol) >= 6 else self.symbol.upper()
         for s in symbols:
-            if target in s.name.upper():
+            if base_symbol in s.name.upper():
                 logger.info(f"Found symbol match: {s.name}")
                 return s.name
         return None
@@ -157,12 +161,15 @@ class MT5Interface:
 
     def modify_position(self, ticket, sl, tp):
         """Modifies SL and TP of an existing position"""
+        info = mt5.symbol_info(self.symbol)
+        digits = info.digits if info else 2
+        
         request = {
             "action": mt5.TRADE_ACTION_SLTP,
             "position": ticket,
             "symbol": self.symbol,
-            "sl": float(sl),
-            "tp": float(tp),
+            "sl": float(round(sl, digits)),
+            "tp": float(round(tp, digits)),
         }
         result = mt5.order_send(request)
         if result.retcode != mt5.TRADE_RETCODE_DONE:

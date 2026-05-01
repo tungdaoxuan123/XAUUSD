@@ -348,10 +348,34 @@ class LiveScalper:
                     self.planner.record_open(now_utc)
                     continue
 
-                # Try to send with TP2; TP1 is handled by manage_open (partial)
-                ok = self.interface.send_order(plan.side, plan.lots, plan.sl, plan.tp2)
+                # Try to send WITHOUT SL/TP first to get the exact real fill price
+                ok = self.interface.send_order(plan.side, plan.lots, sl=0.0, tp=0.0)
                 if not ok:
                     continue
+
+                # Fetch real price to accurately anchor the SL/TP
+                time.sleep(0.2)
+                my_pos = None
+                positions = self.interface.get_positions()
+                if positions:
+                    my_pos = next((p for p in positions if p.ticket == ok.order), None)
+                
+                real_entry = my_pos.price_open if my_pos else plan.entry
+                plan.entry = real_entry
+
+                # Now anchor SL and TP precisely to the broker's real entry price
+                sl_dist = plan.sl_dist
+                if plan.side > 0:
+                    plan.sl  = real_entry - sl_dist
+                    plan.tp1 = real_entry + self.planner.cfg.rr_partial * sl_dist
+                    plan.tp2 = real_entry + self.planner.cfg.rr_final   * sl_dist
+                else:
+                    plan.sl  = real_entry + sl_dist
+                    plan.tp1 = real_entry - self.planner.cfg.rr_partial * sl_dist
+                    plan.tp2 = real_entry - self.planner.cfg.rr_final   * sl_dist
+
+                if my_pos:
+                    self.interface.modify_position(ok.order, plan.sl, plan.tp2)
 
                 self.planner.record_open(now_utc)
                 self.pos = ScalpOpen(
@@ -464,11 +488,13 @@ def main():
                     help="Disable tick-level entry timing (instant market in)")
     ap.add_argument("--hot-seconds", type=float, default=None)
     ap.add_argument("--hot-trigger-now", type=float, default=None)
-    ap.add_argument("--hot-trigger-fb", type=float, default=None)
+    ap.add_argument("--hot-trigger-fb", "--hot-fallback", dest="hot_trigger_fb", type=float, default=None)
     ap.add_argument("--hot-abort", type=float, default=None)
+    ap.add_argument("--hot-abort-atr", type=float, default=None)
     args = ap.parse_args()
 
-    cfg = ScalperConfig()
+    from config import Settings
+    cfg = ScalperConfig(symbol=Settings.SYMBOL)
     if args.min_prob is not None:
         cfg.min_prob_long = cfg.min_prob_short = args.min_prob
     if args.rr_final is not None:    cfg.rr_final = args.rr_final
@@ -485,6 +511,7 @@ def main():
     if args.hot_trigger_now is not None: hot_cfg.trigger_now = args.hot_trigger_now
     if args.hot_trigger_fb is not None:  hot_cfg.trigger_fallback = args.hot_trigger_fb
     if args.hot_abort is not None:       hot_cfg.abort_hard = args.hot_abort
+    if args.hot_abort_atr is not None:   hot_cfg.adverse_momentum_atr = args.hot_abort_atr
 
     LiveScalper(
         device=args.device, scalp_cfg=cfg, hot_cfg=hot_cfg,

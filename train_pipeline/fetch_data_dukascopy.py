@@ -52,6 +52,7 @@ OUTPUT_COLUMNS = ["time", "open", "high", "low", "close", "tick_volume", "spread
 # XAUUSD scale: Dukascopy uses 1000 multiplier (3 decimals)
 SYMBOL_DIVISORS = {
     "XAUUSD": 1000.0,
+    "GBPUSD": 100000.0,
 }
 
 

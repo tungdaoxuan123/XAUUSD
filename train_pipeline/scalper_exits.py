@@ -90,7 +90,7 @@ class ScalperConfig:
     flat_by_minutes_before_close: int = 0  # 0 = disabled for 24h mode
  
     # --- Risk (per trade & per day) ---
-    risk_per_trade:   float = 0.003   # 0.3% per trade
+    risk_per_trade:   float = 0.0015  # Halved from 0.003
     max_risk_frac:    float = 0.005   # hard cap
     daily_goal_R:     float = 999999.0 # Effectively removed
     daily_stop_R:     float = 2.0     # stop for the day at -2R realized
@@ -103,21 +103,30 @@ class ScalperConfig:
     max_spread_ratio: float = 1.4
     news_signed_z_abs: float = 3.5    # slightly looser — overlap has real flow
 
-    # --- SL / TP geometry (tight!) ---
-    atr_mult_sl:      float = 1.1     # tighter than v2's 2.0
-    min_sl_pips:      float = 1.5     # 15 cents XAU floor
+    # --- SL / TP geometry (wider) ---
+    atr_mult_sl:      float = 5.0     # widened from 1.8 for ~$10 range
     rr_partial:       float = 0.5     # TP1 = +0.5R (partial)
     rr_final:         float = 1.2     # TP2 = +1.2R (runner)
     partial_size:     float = 0.5     # close 50% at TP1
     trail_mult_atr:   float = 1.0     # tighter trail after BE
 
     # --- Time / hold ---
-    max_hold_bars:    int   = 12      # hard time stop (12 min on M1)
+    max_hold_bars:    int   = 60      # hard time stop (60 min = 1 hour)
     min_hold_bars:    int   = 1       # allow almost immediate exit
 
-    # --- Symbol mechanics (XAU: 1 lot = 100 oz, $1/point/lot) ---
+    # --- Symbol mechanics (Dynamic based on __post_init__) ---
+    symbol:           str = "XAUUSD"
     contract_size:    float = 100.0
     point_value:      float = 1.0
+    min_sl_price_dist:float = 0.15    # dynamically set
+
+    def __post_init__(self):
+        if "GBP" in self.symbol.upper():
+            self.contract_size = 100000.0
+            self.min_sl_price_dist = 0.00015  # 1.5 pips for Forex
+        else:
+            self.contract_size = 100.0
+            self.min_sl_price_dist = 0.15     # 15 cents for Gold
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +226,7 @@ class ScalperPlanner:
     # -------------------- SL / TP geometry --------------------
 
     def _sl_distance(self, bar_df, atr: float) -> float:
-        return max(self.cfg.atr_mult_sl * atr, self.cfg.min_sl_pips * 0.01)  # pips -> price
+        return max(self.cfg.atr_mult_sl * atr, self.cfg.min_sl_price_dist)
 
     def _size(self, equity: float, sl_dist: float) -> float:
         cfg = self.cfg
@@ -318,8 +327,13 @@ class ScalperPlanner:
         if self.near_session_close(now_utc):
             upd.close_reason = "eod"; return upd
 
-        # Time stop
-        if bar_idx - pos.entry_bar >= cfg.max_hold_bars:
+        # Time stop (max_hold_bars is treated as minutes)
+        if pos.entry_time is not None:
+            elapsed_minutes = (now_utc - pos.entry_time).total_seconds() / 60.0
+            if elapsed_minutes >= cfg.max_hold_bars:
+                upd.close_reason = "time"; return upd
+        elif bar_idx - pos.entry_bar >= cfg.max_hold_bars * 6:
+            # Fallback if entry_time is somehow missing
             upd.close_reason = "time"; return upd
 
         # Update best / unrealized R
