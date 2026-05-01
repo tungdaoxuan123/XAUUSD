@@ -8,23 +8,27 @@ Goal: many small wins, not one big swing.
 
 Differences vs live_sota_trading.py
 -----------------------------------
-  * Uses ScalperPlanner (tight SL ~1.1*ATR, TP1 +0.5R partial, TP2 +1.2R)
-  * Default 24h window (can be restricted via --session-start-utc)
+  * Uses ScalperPlanner (tight SL ~5*ATR, TP1 +0.5R partial, TP2 +1.2R)
+  * Default session: 13:00-17:00 UTC (London-NY overlap = 20:00-00:00 VN)
   * Daily goal/stop: stop trading at +3R or -2R realized
-  * Cooldown after each close (3 bars)
   * Max 20 trades per day
+  * Cooldown after each close (3 bars)
   * Partial close at TP1 (50% of size) + move SL to BE
   * Flat-by-close support (if session end is set)
   * Slightly looser min_prob (0.52) because scalper wants volume;
     edge comes from risk mgmt, not prob threshold.
+  * Hot-window v2: position guard, tick-rate filter, volume-weighted OFI
 
 Usage
 -----
     # Dry run (no orders sent) — recommended first
     python live_scalper_trading.py --dry-run --min-prob 0.52
 
-    # Live
+    # Live (London-NY overlap default)
     python live_scalper_trading.py --min-prob 0.52
+
+    # 24h mode (remove session restriction)
+    python live_scalper_trading.py --session-start-utc 0 --session-end-utc 24
 
     # Tighter/looser profile
     python live_scalper_trading.py --rr-final 1.0 --cooldown 5
@@ -76,13 +80,10 @@ class CalibratedSignal:
         self.device = device if "privateuseone" not in str(device) else "cpu"
 
         logger.info(f"Loading SOTA model: {model_path}  T={self.temperature:.3f}")
-        # Nuclear Option: Monkey-patch the internal rebuilder to ignore DirectML devices
         import torch._utils
         orig_rebuild = torch._utils._rebuild_device_tensor_from_numpy
         def patched_rebuild(data, dtype, device, *args):
-            # args[0] might be requires_grad in some torch versions
             return orig_rebuild(data, dtype, torch.device('cpu'), *args)
-        
         try:
             torch._utils._rebuild_device_tensor_from_numpy = patched_rebuild
             ckpt = torch.load(model_path, map_location='cpu')
@@ -148,11 +149,12 @@ class LiveScalper:
         self.pos: Optional[ScalpOpen] = None
         self.bar_counter = 0
 
-        # Hot-window executor (tick-level entry timing)
+        # Hot-window executor v2 (tick-level entry timing + position guard)
         self.use_hot_window = use_hot_window
         self.hot_executor = HotWindowExecutor(
             cfg=hot_cfg or HotWindowConfig(),
             tick_source=self.interface.get_ticks,
+            position_check_fn=self.interface.get_positions,  # v2: abort if pos opens mid-window
         )
 
         cfg = self.planner.cfg
@@ -186,12 +188,7 @@ class LiveScalper:
             return 0.0
 
     def _live_mid(self) -> float:
-        """Current live mid-price polled directly from broker ticks.
-
-        Used as ref_price for the hot window so slippage is measured
-        relative to *now*, not the stale bar-close from up to 10s ago.
-        Falls back to 0.0 on error (caller must handle 0.0 as invalid).
-        """
+        """Current live mid-price polled directly from broker ticks."""
         try:
             ticks = self.interface.get_ticks(count=1)
             if ticks is None or len(ticks) == 0:
@@ -293,19 +290,8 @@ class LiveScalper:
                 fill_price = plan.entry
                 if self.use_hot_window:
                     atr_val = float(df["ATR"].iloc[-1]) if "ATR" in df.columns else plan.sl_dist / 1.1
-
-                    # FIX: always use raw broker spread — the AI dataframe is
-                    # normalized so df["spread_mean"] is ~0.0, which makes any
-                    # real spread look infinitely wide and aborts every trade.
                     live_spread = self._spread()
                     spread_baseline = max(live_spread, 0.05)
-
-                    # FIX: use live mid as ref_price, NOT plan.entry.
-                    # plan.entry is the bar-close from up to 10s ago; on fast
-                    # XAUUSD moves price may already be 15-20 pts in our favour
-                    # by the time the hot window opens. A stale ref causes the
-                    # slippage check to register that move as adverse slippage,
-                    # blocking every fill. Anchoring to the live mid fixes this.
                     live_ref = self._live_mid()
                     ref_price = live_ref if live_ref > 0 else plan.entry
 
@@ -323,11 +309,9 @@ class LiveScalper:
                     )
                     if not decision.fill:
                         logger.info(f"hot window skipped trade: {decision.reason}")
-                        # Cooldown anyway so we don't immediately re-trigger
                         self.planner.day.last_close_bar = self.bar_counter
                         continue
                     fill_price = decision.fill_price or ref_price
-                    # Re-anchor SL/TPs to actual fill price (preserves R distances)
                     sl_dist = plan.sl_dist
                     if plan.side > 0:
                         plan.sl  = fill_price - sl_dist
@@ -348,22 +332,23 @@ class LiveScalper:
                     self.planner.record_open(now_utc)
                     continue
 
-                # Try to send WITHOUT SL/TP first to get the exact real fill price
-                ok = self.interface.send_order(plan.side, plan.lots, sl=0.0, tp=0.0)
+                # Send order with dynamic slippage cap (3x live spread, min 30 pts)
+                ok = self.interface.send_order(
+                    plan.side, plan.lots, sl=0.0, tp=0.0,
+                    max_slippage_pts=self.interface.dynamic_deviation(spread_pts=self._spread()),
+                )
                 if not ok:
                     continue
 
-                # Fetch real price to accurately anchor the SL/TP
                 time.sleep(0.2)
                 my_pos = None
                 positions = self.interface.get_positions()
                 if positions:
                     my_pos = next((p for p in positions if p.ticket == ok.order), None)
-                
+
                 real_entry = my_pos.price_open if my_pos else plan.entry
                 plan.entry = real_entry
 
-                # Now anchor SL and TP precisely to the broker's real entry price
                 sl_dist = plan.sl_dist
                 if plan.side > 0:
                     plan.sl  = real_entry - sl_dist
@@ -416,7 +401,6 @@ class LiveScalper:
         df = build_live_features(pd.DataFrame(rates), self.sota.features)
         upd = self.planner.manage_open(self.pos, df, self.bar_counter, now_utc)
 
-        # Partial close at TP1 + move SL to BE
         if upd.partial_close_frac > 0:
             part = round(self.pos.initial_lots * upd.partial_close_frac, 2)
             logger.info(f"TP1 hit -> partial close {part} lots, SL->BE")
@@ -433,13 +417,11 @@ class LiveScalper:
                     except Exception as e:
                         logger.warning(f"modify_position failed: {e}")
                 self.pos.sl = upd.new_sl
-            # record TP1 profit as 0.5R * partial fraction (rough bookkeeping)
             self.planner.day.realized_R += (
                 self.planner.cfg.rr_partial * upd.partial_close_frac
             )
             return
 
-        # Trailing SL
         if upd.new_sl is not None and upd.close_reason is None:
             if not dry_run:
                 try:
@@ -450,11 +432,9 @@ class LiveScalper:
             self.pos.sl = upd.new_sl
             return
 
-        # Hard close
         if upd.close_reason is not None:
             last_px = float(df["close"].iloc[-1])
             pnl_R = self._compute_pnl_R(self.pos, last_px)
-            # The partial already booked its portion; attribute remainder here
             remaining = 1.0 - (self.planner.cfg.partial_size if self.pos.tp1_hit else 0.0)
             logger.info(
                 f"CLOSE {upd.close_reason} @ {last_px:.2f} pnl_R~{pnl_R:.2f} "
@@ -471,7 +451,7 @@ class LiveScalper:
 # ---------------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="XAUUSD scalper — VN evening session")
+    ap = argparse.ArgumentParser(description="XAUUSD scalper — London-NY overlap")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--device", type=str, default=None)
     ap.add_argument("--min-prob", type=float, default=None)
@@ -483,9 +463,7 @@ def main():
     ap.add_argument("--stop-r", type=float, default=None)
     ap.add_argument("--session-start-utc", type=int, default=None)
     ap.add_argument("--session-end-utc", type=int, default=None)
-    # Hot-window tuning
-    ap.add_argument("--no-hot-window", action="store_true",
-                    help="Disable tick-level entry timing (instant market in)")
+    ap.add_argument("--no-hot-window", action="store_true")
     ap.add_argument("--hot-seconds", type=float, default=None)
     ap.add_argument("--hot-trigger-now", type=float, default=None)
     ap.add_argument("--hot-trigger-fb", "--hot-fallback", dest="hot_trigger_fb", type=float, default=None)
@@ -495,14 +473,13 @@ def main():
 
     from config import Settings
     cfg = ScalperConfig(symbol=Settings.SYMBOL)
-    if args.min_prob is not None:
-        cfg.min_prob_long = cfg.min_prob_short = args.min_prob
-    if args.rr_final is not None:    cfg.rr_final = args.rr_final
-    if args.rr_partial is not None:  cfg.rr_partial = args.rr_partial
-    if args.max_hold is not None:    cfg.max_hold_bars = args.max_hold
-    if args.cooldown is not None:    cfg.cooldown_bars = args.cooldown
-    if args.goal_r is not None:      cfg.daily_goal_R = args.goal_r
-    if args.stop_r is not None:      cfg.daily_stop_R = args.stop_r
+    if args.min_prob is not None:  cfg.min_prob_long = cfg.min_prob_short = args.min_prob
+    if args.rr_final is not None:  cfg.rr_final = args.rr_final
+    if args.rr_partial is not None: cfg.rr_partial = args.rr_partial
+    if args.max_hold is not None:  cfg.max_hold_bars = args.max_hold
+    if args.cooldown is not None:  cfg.cooldown_bars = args.cooldown
+    if args.goal_r is not None:    cfg.daily_goal_R = args.goal_r
+    if args.stop_r is not None:    cfg.daily_stop_R = args.stop_r
     if args.session_start_utc is not None: cfg.session_start_utc = args.session_start_utc
     if args.session_end_utc is not None:   cfg.session_end_utc = args.session_end_utc
 
