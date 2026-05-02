@@ -323,51 +323,54 @@ def train_primary(
     os.makedirs(out_dir, exist_ok=True)
     model_path = os.path.join(out_dir, "patchtst_primary.pt")
 
-    for ep in range(1, epochs + 1):
-        model.train()
-        tot = 0.0
-        for xb, yb, wb in train_loader:
-            xb = xb.to(device); yb = yb.to(device); wb = wb.to(device)
-            logits = model(xb)
-            loss = loss_fn(logits, yb, weight=wb)
-            opt.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            tot += loss.item() * xb.size(0)
-        sched.step()
-        tr_loss = tot / len(train_loader.dataset)
+    try:
+        for ep in range(1, epochs + 1):
+            model.train()
+            tot = 0.0
+            for xb, yb, wb in train_loader:
+                xb = xb.to(device); yb = yb.to(device); wb = wb.to(device)
+                logits = model(xb)
+                loss = loss_fn(logits, yb, weight=wb)
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                tot += loss.item() * xb.size(0)
+            sched.step()
+            tr_loss = tot / len(train_loader.dataset)
 
-        # Val macro-F1
-        model.eval()
-        preds, trues = [], []
-        with torch.no_grad():
-            for xb, yb, _ in val_loader:
-                xb = xb.to(device)
-                p = model(xb).argmax(-1).cpu().numpy()
-                preds.append(p); trues.append(yb.numpy())
-        preds = np.concatenate(preds); trues = np.concatenate(trues)
-        # macro F1 manually
-        f1s = []
-        for c in range(3):
-            tp = ((preds == c) & (trues == c)).sum()
-            fp = ((preds == c) & (trues != c)).sum()
-            fn = ((preds != c) & (trues == c)).sum()
-            prec = tp / max(tp + fp, 1)
-            rec = tp / max(tp + fn, 1)
-            f1 = 2 * prec * rec / max(prec + rec, 1e-9)
-            f1s.append(f1)
-        f1 = float(np.mean(f1s))
-        logger.info(f"epoch {ep:03d}  train_loss={tr_loss:.4f}  val_macroF1={f1:.4f}")
+            # Val macro-F1
+            model.eval()
+            preds, trues = [], []
+            with torch.no_grad():
+                for xb, yb, _ in val_loader:
+                    xb = xb.to(device)
+                    p = model(xb).argmax(-1).cpu().numpy()
+                    preds.append(p); trues.append(yb.numpy())
+            preds = np.concatenate(preds); trues = np.concatenate(trues)
+            # macro F1 manually
+            f1s = []
+            for c in range(3):
+                tp = ((preds == c) & (trues == c)).sum()
+                fp = ((preds == c) & (trues != c)).sum()
+                fn = ((preds != c) & (trues == c)).sum()
+                prec = tp / max(tp + fp, 1)
+                rec = tp / max(tp + fn, 1)
+                f1 = 2 * prec * rec / max(prec + rec, 1e-9)
+                f1s.append(f1)
+            f1 = float(np.mean(f1s))
+            logger.info(f"epoch {ep:03d}  train_loss={tr_loss:.4f}  val_macroF1={f1:.4f}")
 
-        if f1 > best_f1:
-            best_f1 = f1
-            torch.save({"state": model.state_dict(),
-                        "n_features": n_feat,
-                        "seq_len": seq_len,
-                        "patch_len": patch_len,
-                        "mu": mu,
-                        "sd": sd}, model_path)
+            if f1 > best_f1:
+                best_f1 = f1
+                torch.save({"state": model.state_dict(),
+                            "n_features": n_feat,
+                            "seq_len": seq_len,
+                            "patch_len": patch_len,
+                            "mu": mu,
+                            "sd": sd}, model_path)
+    except KeyboardInterrupt:
+        logger.info("Primary training interrupted by user! Keeping best checkpoint and stopping early.")
 
     logger.info(f"Best val macro-F1: {best_f1:.4f}  saved -> {model_path}")
     return model_path
@@ -409,8 +412,12 @@ def train_meta_filter(
         bagging_freq=5,
         verbose=-1,
     )
-    model = lgb.train(params, train, num_boost_round=2000, valid_sets=[val],
-                      callbacks=[lgb.early_stopping(50), lgb.log_evaluation(100)])
+    try:
+        model = lgb.train(params, train, num_boost_round=2000, valid_sets=[val],
+                          callbacks=[lgb.early_stopping(50), lgb.log_evaluation(100)])
+    except KeyboardInterrupt:
+        logger.info("Meta training interrupted! Will try to save the current booster.")
+        
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, "meta_filter.txt")
     model.save_model(path)

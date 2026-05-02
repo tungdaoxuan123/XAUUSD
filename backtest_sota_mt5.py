@@ -188,6 +188,13 @@ def main():
 
     df = pd.DataFrame(rates)
     df.columns = [c.lower() for c in df.columns]
+    
+    # Calculate ATR since MT5 raw rates do not include it natively
+    hl = df["high"] - df["low"]
+    hc = (df["high"] - df["close"].shift()).abs()
+    lc = (df["low"] - df["close"].shift()).abs()
+    df["ATR"] = pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(14).mean()
+    df["atr"] = df["ATR"] # For compatibility with lowercased components
 
     tester = SOTABacktester(Settings.SOTA_MODEL_PATH, Settings.SOTA_CONFIG_PATH)
     tester.planner.cfg.min_prob_long = args.min_prob
