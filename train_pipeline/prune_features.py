@@ -182,21 +182,6 @@ def run_shap_analysis(
         mean_abs_shap = mean_abs_shap.mean(axis=axes_to_reduce)
         print(f"SHAP squashed to 1D feature array: {mean_abs_shap.shape}")
 
-    else:
-        X_val = df[features].tail(num_samples).reset_index(drop=True)
-        print(f"Using {len(X_val):,} rows for SHAP analysis")
-        explainer = shap.TreeExplainer(model)
-        shap_values = explainer.shap_values(X_val)
-
-        if isinstance(shap_values, list):
-            mean_abs_shap = np.zeros(len(features))
-            for class_shap in shap_values:
-                mean_abs_shap += np.abs(class_shap).mean(axis=0)
-            print(f"Multi-class 2D SHAP: summed across {len(shap_values)} classes")
-        else:
-            mean_abs_shap = np.abs(shap_values).mean(axis=0)
-            print("Binary 2D SHAP: single class")
-
     # --- Build ranking ------------------------------------------------------
     importance_df = pd.DataFrame({
         "feature":          features,
