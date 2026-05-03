@@ -341,8 +341,8 @@ def main():
                    help="Run meta-labeling (requires --preds column 'primary_pred')")
     p.add_argument("--preds",    default=None,
                    help="CSV with primary_pred column aligned to data")
-        p.add_argument("--commission", type=float, default=0.00006,
-                    help="Commission in price terms. Use 0.00003 for JPY pairs.")
+    p.add_argument("--commission", type=float, default=0.00006,
+                help="Commission in price terms. Use 0.00003 for JPY pairs.")
     args = p.parse_args()
 
     df = pd.read_csv(args.data)
