@@ -312,7 +312,8 @@ def compute_uniqueness_weights(tb_hit_idx: np.ndarray, n: int) -> np.ndarray:
             continue
         concurrency[i:end + 1] += 1
     w = np.zeros(n, dtype="float32")
-    for i in range(n):\n        end = tb_hit_idx[i]
+    for i in range(n):
+        end = tb_hit_idx[i]
         if end < 0:
             w[i] = 0
             continue
