@@ -36,7 +36,7 @@ This means:
 
 Cost constants
 --------------
-  COMMISSION_PIPS = 0.00006   FTMO raw account: $6/lot round-trip on GBPUSD
+  COMMISSION_PIPS = args.commission   FTMO raw account: $6/lot round-trip on GBPUSD
                                ($3/lot/side * 2 sides = $6 = 0.6 pips)
   DEFAULT_SPREAD  = 0.00008   0.8 pip fallback when cs_spread column absent
 
@@ -341,6 +341,8 @@ def main():
                    help="Run meta-labeling (requires --preds column 'primary_pred')")
     p.add_argument("--preds",    default=None,
                    help="CSV with primary_pred column aligned to data")
+        p.add_argument("--commission", type=float, default=0.00006,
+                    help="Commission in price terms. Use 0.00003 for JPY pairs.")
     args = p.parse_args()
 
     df = pd.read_csv(args.data)
