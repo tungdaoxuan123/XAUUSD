@@ -96,6 +96,7 @@ logger = logging.getLogger("TripleBarrier")
 
 # FTMO Raw account: $3/lot/side commission on GBPUSD
 # $10/pip/lot => $6 round-trip = 0.6 pips = 0.00006 in price terms
+# NOTE: overwritten in main() via --commission CLI arg
 COMMISSION_PIPS: float = 0.00006
 
 # Fallback spread when the cs_spread / spread_mean / spread_est column is
@@ -311,8 +312,7 @@ def compute_uniqueness_weights(tb_hit_idx: np.ndarray, n: int) -> np.ndarray:
             continue
         concurrency[i:end + 1] += 1
     w = np.zeros(n, dtype="float32")
-    for i in range(n):
-        end = tb_hit_idx[i]
+    for i in range(n):\n        end = tb_hit_idx[i]
         if end < 0:
             w[i] = 0
             continue
@@ -342,8 +342,12 @@ def main():
     p.add_argument("--preds",    default=None,
                    help="CSV with primary_pred column aligned to data")
     p.add_argument("--commission", type=float, default=0.00006,
-                help="Commission in price terms. Use 0.00003 for JPY pairs.")
+                   help="Commission in price terms. Use 0.00003 for JPY pairs.")
     args = p.parse_args()
+
+    # Wire CLI commission arg to the module-level constant used in the labeler
+    global COMMISSION_PIPS
+    COMMISSION_PIPS = args.commission
 
     df = pd.read_csv(args.data)
     df.columns = [c.lower().strip() for c in df.columns]
