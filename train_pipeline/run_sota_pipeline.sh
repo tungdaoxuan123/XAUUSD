@@ -22,10 +22,10 @@ echo "[1/3] Synthetic microstructure features"
 python train_pipeline/synthetic_microstructure.py \
     --m1 "$RAW" --out "$SM" --vp-window 240 --bin-size 0.10 --ofi-window 20
 
-echo "[2/3] Triple-barrier labels"
+echo "[2/3] Triple-barrier labels (LONG-ONLY, 2:1 RR)"
 python train_pipeline/triple_barrier_labels.py \
     --data "$SM" --out "$TB" \
-    --pt-atr 1.5 --sl-atr 1.0 --max-hold 30
+    --pt-atr 2.0 --sl-atr 1.0 --max-hold 30
 
 echo "[3/3] PatchTST-lite primary + LightGBM meta filter"
 python train_pipeline/sota_signal_generator.py \

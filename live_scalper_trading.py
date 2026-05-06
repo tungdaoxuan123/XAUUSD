@@ -1,37 +1,23 @@
 """
-live_scalper_trading.py
-=======================
-High-frequency variant of live_sota_trading.py designed for scalp-style
-trading. Defaulted to 24h trading, but can be restricted to specific sessions.
+live_scalper_trading.py — LONG-ONLY high-frequency scalper
+==========================================================
 
-Goal: many small wins, not one big swing.
+Designed for London-NY overlap (13:00-17:00 UTC = 20:00-00:00 VN).
+Uses PatchTST-lite + calibrated probabilities for LONG-ONLY entries.
 
-Differences vs live_sota_trading.py
------------------------------------
-  * Uses ScalperPlanner (tight SL ~5*ATR, TP1 +0.5R partial, TP2 +1.2R)
-  * Default session: 13:00-17:00 UTC (London-NY overlap = 20:00-00:00 VN)
-  * Daily goal/stop: stop trading at +3R or -2R realized
-  * Max 20 trades per day
-  * Cooldown after each close (3 bars)
+Differences from live_sota_trading.py:
+  * ScalperPlanner (tight SL, TP1 +0.5R partial, TP2 +1.2R)
+  * Default session: 13:00-17:00 UTC
+  * Daily goal/stop: +3R / -2R
+  * Max 20 trades/day, cooldown after each close (3 bars)
   * Partial close at TP1 (50% of size) + move SL to BE
-  * Flat-by-close support (if session end is set)
-  * Slightly looser min_prob (0.52) because scalper wants volume;
-    edge comes from risk mgmt, not prob threshold.
-  * Hot-window v2: position guard, tick-rate filter, volume-weighted OFI
+  * Hot-window v2: tick-level entry timing
 
 Usage
 -----
-    # Dry run (no orders sent) — recommended first
     python live_scalper_trading.py --dry-run --min-prob 0.52
-
-    # Live (London-NY overlap default)
     python live_scalper_trading.py --min-prob 0.52
-
-    # 24h mode (remove session restriction)
     python live_scalper_trading.py --session-start-utc 0 --session-end-utc 24
-
-    # Tighter/looser profile
-    python live_scalper_trading.py --rr-final 1.0 --cooldown 5
 """
 
 from __future__ import annotations
@@ -53,7 +39,7 @@ from config import Settings, setup_logging
 from mt5_interface import MT5Interface
 from risk_manager import FTMORiskManager
 
-from train_pipeline.sota_signal_generator import PatchTSTLite, LABEL_UNMAP
+from train_pipeline.sota_signal_generator import PatchTSTLite
 from train_pipeline.live_features import build_live_features
 from train_pipeline.scalper_exits import (
     ScalperPlanner, ScalperConfig, ScalpOpen,
@@ -65,11 +51,9 @@ from train_pipeline.hot_window_executor import (
 logger = setup_logging()
 
 
-# ---------------------------------------------------------------------------
-# Model inference (calibrated probabilities via temperature)
-# ---------------------------------------------------------------------------
-
 class CalibratedSignal:
+    """PatchTST inference with calibrated (temperature-scaled) binary probabilities."""
+
     def __init__(self, model_path: str, config_path: str, device: str = "cpu"):
         with open(config_path) as f:
             cfg = json.load(f)
@@ -106,10 +90,10 @@ class CalibratedSignal:
         missing = [f for f in self.features if f not in df.columns]
         if missing:
             logger.error(f"predict: missing feats {missing[:5]}… ({len(missing)})")
-            return 0, 1/3, 1/3, 1/3
+            return 0, 0.5, 0.5, 0.5
         X = df[self.features].astype("float32").values[-self.seq_len:]
         if len(X) < self.seq_len:
-            return 0, 1/3, 1/3, 1/3
+            return 0, 0.5, 0.5, 0.5
         X = torch.tensor(X, device=self.device)
         if self.mu is not None:
             X = (X - self.mu) / self.sd
@@ -120,13 +104,13 @@ class CalibratedSignal:
             logits = self.model(X)
             probs = F.softmax(logits / max(self.temperature, 1e-3), dim=-1)
             p = probs.cpu().numpy()[0]
-        signal = int(LABEL_UNMAP[int(p.argmax())])
-        return signal, float(p[2]), float(p[0]), float(p[1])
+        if p.shape[0] >= 2:
+            p_long = float(p[1]); p_wait = float(p[0])
+        else:
+            p_long = float(p[0]); p_wait = 1.0 - p_long
+        signal = 1 if p_long > 0.5 else 0
+        return signal, p_long, p_wait, p_wait
 
-
-# ---------------------------------------------------------------------------
-# Scalper live loop
-# ---------------------------------------------------------------------------
 
 class LiveScalper:
     def __init__(self, model_path=None, config_path=None, device=None,
@@ -149,25 +133,21 @@ class LiveScalper:
         self.pos: Optional[ScalpOpen] = None
         self.bar_counter = 0
 
-        # Hot-window executor v2 (tick-level entry timing + position guard)
         self.use_hot_window = use_hot_window
         self.hot_executor = HotWindowExecutor(
             cfg=hot_cfg or HotWindowConfig(),
             tick_source=self.interface.get_ticks,
-            position_check_fn=self.interface.get_positions,  # v2: abort if pos opens mid-window
+            position_check_fn=self.interface.get_positions,
         )
 
         cfg = self.planner.cfg
         logger.info(
-            f"LiveScalper ready symbol={self.symbol} "
+            f"LONG-ONLY Scalper ready symbol={self.symbol} "
             f"session={cfg.session_start_utc:02d}-{cfg.session_end_utc:02d}UTC "
-            f"(={cfg.session_start_utc+7:02d}-{cfg.session_end_utc+7:02d}VN) "
             f"RR={cfg.rr_partial}/{cfg.rr_final} cooldown={cfg.cooldown_bars} "
             f"goal=+{cfg.daily_goal_R}R stop=-{cfg.daily_stop_R}R "
             f"maxHold={cfg.max_hold_bars} maxTrades={cfg.max_trades_per_day}"
         )
-
-    # ---- helpers ----------------------------------------------------------
 
     def _equity(self) -> float:
         try:
@@ -177,7 +157,6 @@ class LiveScalper:
             return float(getattr(self.settings, "INITIAL_BALANCE", 10000.0))
 
     def _spread(self) -> float:
-        """Raw live ask-bid spread from broker (never from the AI dataframe)."""
         try:
             ticks = self.interface.get_ticks(count=1)
             if ticks is None or len(ticks) == 0:
@@ -188,7 +167,6 @@ class LiveScalper:
             return 0.0
 
     def _live_mid(self) -> float:
-        """Current live mid-price polled directly from broker ticks."""
         try:
             ticks = self.interface.get_ticks(count=1)
             if ticks is None or len(ticks) == 0:
@@ -209,14 +187,10 @@ class LiveScalper:
         sl_dist = abs(pos.entry - pos.sl)
         if sl_dist <= 0:
             return 0.0
-        if pos.side > 0:
-            return (exit_price - pos.entry) / sl_dist
-        return (pos.entry - exit_price) / sl_dist
-
-    # ---- main loop --------------------------------------------------------
+        return (exit_price - pos.entry) / sl_dist
 
     def run(self, interval_s: int = 10, dry_run: bool = False):
-        logger.info(f"scalper loop interval={interval_s}s dry_run={dry_run}")
+        logger.info(f"LONG-ONLY scalper loop interval={interval_s}s dry_run={dry_run}")
         if not self.interface.initialize():
             logger.error("MT5 init failed"); return
         self.risk_mgr.initialize_balance()
@@ -231,16 +205,13 @@ class LiveScalper:
                 self.bar_counter += 1
                 now_utc = self._now_utc()
 
-                # ---- 1) Manage any open position first ----
                 positions = self.interface.get_positions() or []
                 if len(positions) > 0:
                     self._manage_open(positions, now_utc, dry_run=dry_run)
                     continue
 
-                # No broker-side position: clear local tracker if needed
                 self.pos = None
 
-                # ---- 2) Session & daily checks ----
                 if not self.planner.session_open(now_utc):
                     if self.bar_counter % 30 == 0:
                         logger.info(f"waiting for session (now {now_utc:%H:%M}UTC)")
@@ -251,7 +222,6 @@ class LiveScalper:
                         logger.info(f"daily done: {done}")
                     continue
 
-                # ---- 3) Feature pipeline ----
                 target = "XAUUSD" if "XAU" in self.symbol else self.symbol
                 rates = self.interface.get_rates(
                     count=max(300, self.sota.seq_len + 50), symbol=target,
@@ -260,19 +230,18 @@ class LiveScalper:
                     continue
                 df = build_live_features(pd.DataFrame(rates), self.sota.features)
 
-                # ---- 4) Signal ----
-                signal, p_buy, p_sell, p_hold = self.sota.predict(df)
-                prob_dir = p_buy if signal > 0 else p_sell if signal < 0 else p_hold
+                signal, p_long, p_wait, _ = self.sota.predict(df)
                 logger.info(
-                    f"scan {signal:+d} p_b={p_buy:.3f} p_s={p_sell:.3f} p_h={p_hold:.3f} "
-                    f"R_today={self.planner.day.realized_R:+.2f} trades={self.planner.day.trades_taken}"
+                    f"scan {'LONG' if signal>0 else 'WAIT'} "
+                    f"p_long={p_long:.3f} p_wait={p_wait:.3f} "
+                    f"R_today={self.planner.day.realized_R:+.2f} "
+                    f"trades={self.planner.day.trades_taken}"
                 )
                 if signal == 0:
                     continue
 
-                # ---- 5) Build scalp plan ----
                 plan = self.planner.build_plan(
-                    signal, prob_dir, df, self._equity(),
+                    signal, p_long, df, self._equity(),
                     self._spread(), now_utc, self.bar_counter,
                 )
                 if plan.skip:
@@ -280,13 +249,11 @@ class LiveScalper:
                     continue
 
                 logger.info(
-                    f"PLAN {'BUY' if plan.side>0 else 'SELL'} "
-                    f"lots={plan.lots:.2f} entry={plan.entry:.2f} "
+                    f"PLAN LONG lots={plan.lots:.2f} entry={plan.entry:.2f} "
                     f"sl={plan.sl:.2f} tp1={plan.tp1:.2f} tp2={plan.tp2:.2f} "
                     f"risk={plan.equity_risk*100:.2f}%"
                 )
 
-                # ---- 6) Hot-window tick-level entry timing ----
                 fill_price = plan.entry
                 if self.use_hot_window:
                     atr_val = float(df["ATR"].iloc[-1]) if "ATR" in df.columns else plan.sl_dist / 1.1
@@ -295,12 +262,6 @@ class LiveScalper:
                     live_ref = self._live_mid()
                     ref_price = live_ref if live_ref > 0 else plan.entry
 
-                    logger.info(
-                        f"hot window ref={ref_price:.2f} "
-                        f"(plan.entry={plan.entry:.2f} drift={ref_price - plan.entry:+.2f}) "
-                        f"spread_baseline={spread_baseline:.3f}"
-                    )
-
                     decision = self.hot_executor.run(
                         signal=plan.side,
                         ref_price=ref_price,
@@ -308,31 +269,23 @@ class LiveScalper:
                         spread_baseline=spread_baseline,
                     )
                     if not decision.fill:
-                        logger.info(f"hot window skipped trade: {decision.reason}")
+                        logger.info(f"hot window skipped: {decision.reason}")
                         self.planner.day.last_close_bar = self.bar_counter
                         continue
                     fill_price = decision.fill_price or ref_price
                     sl_dist = plan.sl_dist
-                    if plan.side > 0:
-                        plan.sl  = fill_price - sl_dist
-                        plan.tp1 = fill_price + self.planner.cfg.rr_partial * sl_dist
-                        plan.tp2 = fill_price + self.planner.cfg.rr_final   * sl_dist
-                    else:
-                        plan.sl  = fill_price + sl_dist
-                        plan.tp1 = fill_price - self.planner.cfg.rr_partial * sl_dist
-                        plan.tp2 = fill_price - self.planner.cfg.rr_final   * sl_dist
+                    plan.sl  = fill_price - sl_dist
+                    plan.tp1 = fill_price + self.planner.cfg.rr_partial * sl_dist
+                    plan.tp2 = fill_price + self.planner.cfg.rr_final   * sl_dist
                     plan.entry = fill_price
                     logger.info(
-                        f"hot fill @ {fill_price:.2f} "
-                        f"({decision.reason}, {decision.elapsed_seconds:.1f}s, "
-                        f"{decision.samples} samples)"
+                        f"hot fill @ {fill_price:.2f} ({decision.reason}, {decision.elapsed_seconds:.1f}s)"
                     )
 
                 if dry_run:
                     self.planner.record_open(now_utc)
                     continue
 
-                # Send order with dynamic slippage cap (3x live spread, min 30 pts)
                 ok = self.interface.send_order(
                     plan.side, plan.lots, sl=0.0, tp=0.0,
                     max_slippage_pts=self.interface.dynamic_deviation(spread_pts=self._spread()),
@@ -348,16 +301,10 @@ class LiveScalper:
 
                 real_entry = my_pos.price_open if my_pos else plan.entry
                 plan.entry = real_entry
-
                 sl_dist = plan.sl_dist
-                if plan.side > 0:
-                    plan.sl  = real_entry - sl_dist
-                    plan.tp1 = real_entry + self.planner.cfg.rr_partial * sl_dist
-                    plan.tp2 = real_entry + self.planner.cfg.rr_final   * sl_dist
-                else:
-                    plan.sl  = real_entry + sl_dist
-                    plan.tp1 = real_entry - self.planner.cfg.rr_partial * sl_dist
-                    plan.tp2 = real_entry - self.planner.cfg.rr_final   * sl_dist
+                plan.sl  = real_entry - sl_dist
+                plan.tp1 = real_entry + self.planner.cfg.rr_partial * sl_dist
+                plan.tp2 = real_entry + self.planner.cfg.rr_final   * sl_dist
 
                 if my_pos:
                     self.interface.modify_position(ok.order, plan.sl, plan.tp2)
@@ -379,13 +326,11 @@ class LiveScalper:
         finally:
             self.interface.shutdown()
 
-    # ---- in-trade management ---------------------------------------------
-
     def _manage_open(self, positions, now_utc: datetime, dry_run: bool = False):
         if self.pos is None:
             p = positions[0]
             self.pos = ScalpOpen(
-                side=+1 if p.type == 0 else -1,
+                side=+1,
                 entry=float(p.price_open),
                 sl=float(p.sl), tp1=float(p.tp), tp2=float(p.tp),
                 entry_bar=self.bar_counter, entry_time=now_utc,
@@ -412,21 +357,17 @@ class LiveScalper:
             if upd.new_sl is not None:
                 if not dry_run:
                     try:
-                        self.interface.modify_position(
-                            positions[0].ticket, upd.new_sl, self.pos.tp2)
+                        self.interface.modify_position(positions[0].ticket, upd.new_sl, self.pos.tp2)
                     except Exception as e:
-                        logger.warning(f"modify_position failed: {e}")
+                        logger.warning(f"modify failed: {e}")
                 self.pos.sl = upd.new_sl
-            self.planner.day.realized_R += (
-                self.planner.cfg.rr_partial * upd.partial_close_frac
-            )
+            self.planner.day.realized_R += self.planner.cfg.rr_partial * upd.partial_close_frac
             return
 
         if upd.new_sl is not None and upd.close_reason is None:
             if not dry_run:
                 try:
-                    self.interface.modify_position(
-                        positions[0].ticket, upd.new_sl, self.pos.tp2)
+                    self.interface.modify_position(positions[0].ticket, upd.new_sl, self.pos.tp2)
                 except Exception as e:
                     logger.warning(f"trail modify failed: {e}")
             self.pos.sl = upd.new_sl
@@ -436,22 +377,15 @@ class LiveScalper:
             last_px = float(df["close"].iloc[-1])
             pnl_R = self._compute_pnl_R(self.pos, last_px)
             remaining = 1.0 - (self.planner.cfg.partial_size if self.pos.tp1_hit else 0.0)
-            logger.info(
-                f"CLOSE {upd.close_reason} @ {last_px:.2f} pnl_R~{pnl_R:.2f} "
-                f"(remaining={remaining:.2f})"
-            )
+            logger.info(f"CLOSE {upd.close_reason} @ {last_px:.2f} pnl_R~{pnl_R:.2f}")
             if not dry_run:
                 self.interface.close_all_positions()
             self.planner.record_close(pnl_R * remaining, self.bar_counter, now_utc)
             self.pos = None
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def main():
-    ap = argparse.ArgumentParser(description="XAUUSD scalper — London-NY overlap")
+    ap = argparse.ArgumentParser(description="XAUUSD LONG-ONLY scalper")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--device", type=str, default=None)
     ap.add_argument("--min-prob", type=float, default=None)
@@ -471,9 +405,8 @@ def main():
     ap.add_argument("--hot-abort-atr", type=float, default=None)
     args = ap.parse_args()
 
-    from config import Settings
     cfg = ScalperConfig(symbol=Settings.SYMBOL)
-    if args.min_prob is not None:  cfg.min_prob_long = cfg.min_prob_short = args.min_prob
+    if args.min_prob is not None:  cfg.min_prob_long = args.min_prob
     if args.rr_final is not None:  cfg.rr_final = args.rr_final
     if args.rr_partial is not None: cfg.rr_partial = args.rr_partial
     if args.max_hold is not None:  cfg.max_hold_bars = args.max_hold

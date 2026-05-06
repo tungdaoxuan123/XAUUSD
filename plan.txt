@@ -1,34 +1,136 @@
-I have a training pipeline for XAUUSD M1 LightGBM ensemble. 
-I need a Python script that:
+Perfect. Here's exactly what to do:
 
-1. Downloads the dataset from HuggingFace: https://huggingface.co/datasets/Pcitycrypto/xauusd
-   - Use: pip install datasets huggingface_hub
-   - Or direct CSV download via hf:// path or requests
+***
 
-2. Renames columns to match my pipeline's REQUIRED_COLUMNS:
-   - "datetime" -> "time"
-   - "tickvol"  -> "tick_volume"
-   - keep: open, high, low, close as-is
+## USDJPY Colab Execution Plan
 
-3. Cleans the data:
-   - Parse "time" as datetime
-   - Sort ascending by time
-   - Drop rows where open/high/low/close/tick_volume is NaN or 0
-   - Remove duplicate timestamps
-   - Remove weekends (Saturday, Sunday)
-   - Remove rows where close <= 0
+### Before You Run: Parameter Changes
 
-4. Saves the cleaned file to:
-   train_pipeline/data/xauusd_m1.csv
+Open the `USDJPY_AllInOne_Colab.ipynb` notebook and make these **4 edits**:
 
-5. Prints a summary:
-   - Total rows saved
-   - Date range (first and last timestamp)
-   - Label distribution preview using:
-       horizon=5, buy_threshold=0.0005, sell_threshold=0.0005
-     Show count of -1, 0, +1 labels so I can verify SELL signals exist
+#### **Edit 1: Cell with `synthetic_microstructure.py`**
 
-The final CSV must have exactly these columns in this order:
-time, open, high, low, close, tick_volume
+Find the line:
+```bash
+!python syntheticmicrostructure.py --m1 data/usdjpy_m1.csv --out data/usdjpy_m1_synmicro.csv
+```
 
-No extra columns. Save as UTF-8 CSV with no index column.
+Add these params:
+```bash
+!python syntheticmicrostructure.py \
+    --m1 data/usdjpy_m1.csv \
+    --out data/usdjpy_m1_synmicro.csv \
+    --vp-window 90 \
+    --bin-size 0.01 \
+    --ofi-window 15
+```
+
+***
+
+#### **Edit 2: Cell with `triplebarrierlabels.py`**
+
+Find the line:
+```bash
+!python triplebarrierlabels.py --data data/usdjpy_m1_synmicro.csv --out data/usdjpy_m1_tb.csv
+```
+
+Change to:
+```bash
+!python triplebarrierlabels.py \
+    --data data/usdjpy_m1_synmicro.csv \
+    --out data/usdjpy_m1_tb.csv \
+    --pt-atr 3.0 \
+    --sl-atr 0.8 \
+    --max-hold 10
+```
+
+***
+
+#### **Edit 3: Cell with `trainsotav2.py`**
+
+Find the line:
+```bash
+!python trainsotav2.py --data data/usdjpy_m1_tb.csv --out-dir reports/usdjpy --seq-len 60 --patch-len 8 --epochs 40 --gpu
+```
+
+Change to:
+```bash
+!python trainsotav2.py \
+    --data data/usdjpy_m1_tb.csv \
+    --out-dir reports/usdjpy \
+    --seq-len 60 \
+    --patch-len 8 \
+    --epochs 50 \
+    --patience 10 \
+    --gpu
+```
+
+***
+
+#### **Edit 4: In `sota_signal_generator.py` cell**
+
+Find the `FEATURECOLS` definition. Locate this block:
+```python
+SESSIONFEATURES , 
+    isasian, islondon, isny, isoverlap,
+```
+
+**Delete those 4 lines entirely** (session labels are noise for JPY).
+
+Keep only:
+```python
+SESSIONFEATURES , 
+    dowsin, dowcos, hoursin, hourcos,
+```
+
+***
+
+### What to Expect
+
+| Stage | Expected Behavior |
+|---|---|
+| **Synthetic Microstructure** | Runs 25–30 sec; should produce `usdjpy_m1_synmicro.csv` with 0 nulls in key features |
+| **Triple Barrier Labels** | Runs 10 sec; should show label dist: `{-1: ~62%, 0: ~5%, 1: ~33%}` (inverted vs GBPUSD) |
+| **Training** | Runs 30–40 min; expect F1 to climb from 0.25 → 0.38–0.42 by epoch 40–45 |
+| **SHAP Pruning** | Runs 3–5 min; will show which JPY-specific features matter (expect OFI + vol profile, NOT session labels) |
+
+***
+
+### What to Collect & Report Back
+
+When training finishes, **paste these 3 things here**:
+
+**1. Final Training Log** (epochs 35–50):
+```
+2026-05-02 XX:XX:XX,XXX - INFO - epoch 040 loss=0.XXXX macroF1=0.XXXX per_cls=[...]
+2026-05-02 XX:XX:XX,XXX - INFO - epoch 045 loss=0.XXXX macroF1=0.XXXX per_cls=[...]
+2026-05-02 XX:XX:XX,XXX - INFO - epoch 050 loss=0.XXXX macroF1=0.XXXX per_cls=[...]
+2026-05-02 XX:XX:XX,XXX - INFO - Early stop at epoch XX (best F1=X.XXXX)
+```
+
+**2. SHAP Output** (bottom 10 features to prune):
+```
+============================================================
+BOTTOM N FEATURES TO PRUNE
+============================================================
+feature                  shap_importance
+[paste all 10 rows]
+
+DROP_FEATURES = [
+    "feature_name",
+    ...
+]
+```
+
+**3. Your Observation**: Does the inverted label distribution (62% short, 33% long) make sense for USDJPY? Is the final F1 in the 0.38–0.45 range as expected?
+
+***
+
+## Timeline
+
+- **Run time**: ~50 min (Colab GPU)
+- **Report back**: ~60 min from now
+
+Then we'll **analyze the JPY edge structure** and decide: is a separate USDJPY bot worth building, or should you focus all energy on GBPUSD → FTMO?
+
+Go ahead and run the notebook with those 4 edits. I'll be standing by for the output.

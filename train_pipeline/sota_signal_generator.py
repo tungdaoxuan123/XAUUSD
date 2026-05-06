@@ -34,7 +34,7 @@ The *lite* variant here keeps:
   - Patch embedding
   - 3-layer encoder with multi-head self-attention
   - Channel-independent representation (each feature learned separately)
-  - Direct 3-class head (SELL/HOLD/BUY) with focal loss for class imbalance
+  - Direct binary head (WAIT/LONG) with focal loss for class imbalance
 
 If `torch` isn't installed, the script will still run the LightGBM
 ensemble path — matching your existing behavior but using the better
@@ -116,11 +116,10 @@ FEATURE_COLS = [
     "jump_flag", "signed_vol_z", "vol_regime",
 ]
 
-LABEL_COL_DEFAULT = "tb_label"  # from triple_barrier_labels.py
+LABEL_COL_DEFAULT = "tb_label"  # from triple_barrier_labels.py (binary: 0/1)
 SAMPLE_WEIGHT_COL = "sample_weight"
 
-LABEL_MAP = {-1: 0, 0: 1, 1: 2}
-LABEL_UNMAP = {0: -1, 1: 0, 2: 1}
+LABEL_UNMAP = {0: 0, 1: 1}
 
 
 # ---------------------------------------------------------------------------
@@ -159,8 +158,8 @@ def build_windows(
     if usable <= 0:
         raise ValueError(f"Not enough rows ({n}) for seq_len={seq_len}")
 
-    # Labels and weights aligned to the END of each window
-    y = np.array([LABEL_MAP[int(y_raw[i + seq_len - 1])] for i in range(usable)], dtype="int64")
+    # Labels and weights aligned to the END of each window (binary)
+    y = np.array([int(y_raw[i + seq_len - 1]) for i in range(usable)], dtype="int64")
     sw = np.array([w[i + seq_len - 1] for i in range(usable)], dtype="float32")
 
     return X_feat, y, sw
@@ -172,7 +171,7 @@ def build_windows(
 
 if HAS_TORCH:
     class PatchTSTLite(nn.Module):
-        """Channel-independent PatchTST-lite encoder with 3-class head."""
+        """Channel-independent PatchTST-lite encoder with binary head (LONG/WAIT)."""
 
         def __init__(
             self,
@@ -183,7 +182,7 @@ if HAS_TORCH:
             n_heads: int = 4,
             n_layers: int = 3,
             dropout: float = 0.1,
-            n_classes: int = 3,
+            n_classes: int = 2,
         ):
             super().__init__()
             assert seq_len % patch_len == 0, "seq_len must be divisible by patch_len"
@@ -300,9 +299,9 @@ def train_primary(
     y_tr, y_va = y[:cut], y[cut:]
     w_tr, w_va = w[:cut], w[cut:]
 
-    cls_counts = np.bincount(y_tr, minlength=3)
+    cls_counts = np.bincount(y_tr, minlength=2)
     inv = 1.0 / np.maximum(cls_counts, 1)
-    alpha = torch.tensor(inv / inv.sum() * 3, dtype=torch.float32)
+    alpha = torch.tensor(inv / inv.sum() * 2, dtype=torch.float32)
     logger.info(f"Class counts: {cls_counts.tolist()}  alpha={alpha.tolist()}")
 
     model = PatchTSTLite(n_features=n_feat, seq_len=seq_len,
@@ -339,7 +338,7 @@ def train_primary(
             sched.step()
             tr_loss = tot / len(train_loader.dataset)
 
-            # Val macro-F1
+            # Val binary F1
             model.eval()
             preds, trues = [], []
             with torch.no_grad():
@@ -348,18 +347,14 @@ def train_primary(
                     p = model(xb).argmax(-1).cpu().numpy()
                     preds.append(p); trues.append(yb.numpy())
             preds = np.concatenate(preds); trues = np.concatenate(trues)
-            # macro F1 manually
-            f1s = []
-            for c in range(3):
-                tp = ((preds == c) & (trues == c)).sum()
-                fp = ((preds == c) & (trues != c)).sum()
-                fn = ((preds != c) & (trues == c)).sum()
-                prec = tp / max(tp + fp, 1)
-                rec = tp / max(tp + fn, 1)
-                f1 = 2 * prec * rec / max(prec + rec, 1e-9)
-                f1s.append(f1)
-            f1 = float(np.mean(f1s))
-            logger.info(f"epoch {ep:03d}  train_loss={tr_loss:.4f}  val_macroF1={f1:.4f}")
+            # Binary F1 for class 1 (long)
+            tp = ((preds == 1) & (trues == 1)).sum()
+            fp = ((preds == 1) & (trues == 0)).sum()
+            fn = ((preds == 0) & (trues == 1)).sum()
+            prec = tp / max(tp + fp, 1)
+            rec = tp / max(tp + fn, 1)
+            f1 = 2 * prec * rec / max(prec + rec, 1e-9)
+            logger.info(f"epoch {ep:03d}  train_loss={tr_loss:.4f}  val_F1={f1:.4f}")
 
             if f1 > best_f1:
                 best_f1 = f1
@@ -372,7 +367,7 @@ def train_primary(
     except KeyboardInterrupt:
         logger.info("Primary training interrupted by user! Keeping best checkpoint and stopping early.")
 
-    logger.info(f"Best val macro-F1: {best_f1:.4f}  saved -> {model_path}")
+    logger.info(f"Best val F1: {best_f1:.4f}  saved -> {model_path}")
     return model_path
 
 
@@ -483,10 +478,10 @@ def predict_combined(
     
     probs = np.concatenate(probs_list, axis=0)
     primary = np.argmax(probs, axis=1)
-    primary_cls = np.array([LABEL_UNMAP[c] for c in primary], dtype="int8")
+    primary_cls = np.array(primary, dtype="int8")  # 0=WAIT, 1=LONG
 
     out = pd.DataFrame(index=df.index[seq_len - 1 :])
-    out["p_sell"], out["p_hold"], out["p_buy"] = probs[:, 0], probs[:, 1], probs[:, 2]
+    out["p_wait"], out["p_long"] = probs[:, 0], probs[:, 1]
     out["primary_pred"] = primary_cls
 
     # Meta filter
@@ -495,7 +490,7 @@ def predict_combined(
         X_meta = df[feats].astype("float32").iloc[seq_len - 1 :].values
         out["meta_score"] = meta.predict(X_meta)
         out["final_signal"] = np.where(
-            (out["primary_pred"] != 0) & (out["meta_score"] >= threshold_meta),
+            (out["primary_pred"] > 0) & (out["meta_score"] >= threshold_meta),
             out["primary_pred"], 0,
         ).astype("int8")
     else:
@@ -610,7 +605,7 @@ def main():
                 p = model(xb.to(device)).argmax(-1).cpu().numpy()
                 preds_full.append(p)
             preds_full = np.concatenate(preds_full)
-            primary_cls = np.array([LABEL_UNMAP[c] for c in preds_full], dtype="int8")
+            primary_cls = preds_full.astype("int8")
         # Align with df: window i produces a label at bar i + seq_len - 1
         aligned = np.zeros(len(df), dtype="int8")
         aligned[args.seq_len - 1 : args.seq_len - 1 + len(primary_cls)] = primary_cls

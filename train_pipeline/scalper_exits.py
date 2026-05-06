@@ -59,9 +59,8 @@ class ScalperConfig:
     daily_stop_R:     float = 2.0      # stop trading at -2R (unchanged)
     max_trades_per_day: int = 20       # restored from 1000
 
-    # --- Entry gating ---
+    # --- Entry gating (long-only) ---
     min_prob_long:    float = 0.52
-    min_prob_short:   float = 0.52
     cooldown_bars:    int   = 3
     max_spread_ratio: float = 1.4
     news_signed_z_abs: float = 3.5
@@ -202,8 +201,8 @@ class ScalperPlanner:
         plan = ScalpPlan(prob=prob)
         self._rollover(now_utc)
 
-        if signal == 0:
-            plan.skip = True; plan.reason = "no signal"; return plan
+        if signal <= 0:
+            plan.skip = True; plan.reason = "no long signal"; return plan
 
         if not self.session_open(now_utc):
             plan.skip = True
@@ -221,9 +220,8 @@ class ScalperPlanner:
             plan.reason = f"cooldown ({current_bar - self.day.last_close_bar}<{cfg.cooldown_bars})"
             return plan
 
-        thr = cfg.min_prob_long if signal > 0 else cfg.min_prob_short
-        if prob < thr:
-            plan.skip = True; plan.reason = f"p {prob:.2f} < {thr}"; return plan
+        if prob < cfg.min_prob_long:
+            plan.skip = True; plan.reason = f"p_long {prob:.2f} < {cfg.min_prob_long}"; return plan
 
         if "spread_mean" in bar_df.columns:
             sm = float(bar_df["spread_mean"].iloc[-5:].mean())
@@ -234,8 +232,8 @@ class ScalperPlanner:
 
         if "signed_vol_z" in bar_df.columns:
             z = float(bar_df["signed_vol_z"].iloc[-1])
-            if abs(z) > cfg.news_signed_z_abs and np.sign(z) != signal:
-                plan.skip = True; plan.reason = f"contrarian to z={z:.1f}"; return plan
+            if abs(z) > cfg.news_signed_z_abs and z < 0:
+                plan.skip = True; plan.reason = f"contrarian vol z={z:.1f}"; return plan
 
         atr = float(bar_df["ATR"].iloc[-1])
         if not np.isfinite(atr) or atr <= 0:
@@ -243,14 +241,9 @@ class ScalperPlanner:
 
         entry = float(bar_df["close"].iloc[-1])
         sl_dist = self._sl_distance(bar_df, atr)
-        if signal > 0:
-            sl  = entry - sl_dist
-            tp1 = entry + cfg.rr_partial * sl_dist
-            tp2 = entry + cfg.rr_final   * sl_dist
-        else:
-            sl  = entry + sl_dist
-            tp1 = entry - cfg.rr_partial * sl_dist
-            tp2 = entry - cfg.rr_final   * sl_dist
+        sl  = entry - sl_dist
+        tp1 = entry + cfg.rr_partial * sl_dist
+        tp2 = entry + cfg.rr_final   * sl_dist
 
         lots = self._size(equity, sl_dist)
         plan.side = signal
@@ -279,14 +272,9 @@ class ScalperPlanner:
         elif bar_idx - pos.entry_bar >= cfg.max_hold_bars * 6:
             upd.close_reason = "time"; return upd
 
-        if pos.side > 0:
-            pos.best_price = max(pos.best_price, last)
-            tp1_hit = last >= pos.tp1
-            tp2_hit = last >= pos.tp2
-        else:
-            pos.best_price = min(pos.best_price, last)
-            tp1_hit = last <= pos.tp1
-            tp2_hit = last <= pos.tp2
+        pos.best_price = max(pos.best_price, last)
+        tp1_hit = last >= pos.tp1
+        tp2_hit = last >= pos.tp2
 
         if tp2_hit:
             upd.close_reason = "tp2"; return upd
@@ -300,14 +288,9 @@ class ScalperPlanner:
 
         if pos.be_moved and atr > 0:
             trail_dist = cfg.trail_mult_atr * atr
-            if pos.side > 0:
-                new_sl = pos.best_price - trail_dist
-                if new_sl > pos.sl:
-                    upd.new_sl = new_sl
-            else:
-                new_sl = pos.best_price + trail_dist
-                if new_sl < pos.sl:
-                    upd.new_sl = new_sl
+            new_sl = pos.best_price - trail_dist
+            if new_sl > pos.sl:
+                upd.new_sl = new_sl
         return upd
 
     def record_close(self, pnl_R: float, close_bar: int, now_utc: datetime):

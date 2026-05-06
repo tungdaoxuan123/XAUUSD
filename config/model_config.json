@@ -1,0 +1,43 @@
+{
+  "model_type": "ensemble-trading-system",
+  "algorithms": [
+    "PPO",
+    "TD3",
+    "SAC"
+  ],
+  "framework": "stable-baselines3",
+  "environment": "gymnasium",
+  "asset": "XAUUSD",
+  "timeframe": "daily",
+  "features": 25,
+  "performance": {
+    "win_rate": 0.583,
+    "avg_win": 49.45,
+    "avg_loss": -106.18,
+    "risk_reward_ratio": 0.47,
+    "sharpe_ratio": 2.0,
+    "max_drawdown": 0.05
+  },
+  "regimes": [
+    "strong_bull",
+    "bull_trend",
+    "bear_trend",
+    "strong_bear",
+    "ranging",
+    "high_volatility"
+  ],
+  "risk_management": {
+    "scaled_profit_taking": [
+      0.01,
+      0.02,
+      0.05,
+      0.1
+    ],
+    "breakeven_threshold": 0.015,
+    "trailing_stop": 0.025,
+    "confidence_sizing": [
+      0.5,
+      2.0
+    ]
+  }
+}

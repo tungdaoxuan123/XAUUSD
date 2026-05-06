@@ -286,9 +286,11 @@ class MT5Interface:
             return None
 
         ticket = result.order
+        # Use result.price if available, else use the price from our request
+        exec_price = result.price if (result.price and result.price > 0) else price
         logger.info(
             f"ORDER OPENED: {'BUY' if signal > 0 else 'SELL'} {volume} lot(s) "
-            f"at {result.price} deviation={max_slippage_pts}pts (Ticket: {ticket})"
+            f"at {exec_price} deviation={max_slippage_pts}pts (Ticket: {ticket})"
         )
 
         if sl > 0 or tp > 0:
@@ -299,24 +301,51 @@ class MT5Interface:
         return result
 
     def modify_position(self, ticket, sl, tp):
-        info   = mt5.symbol_info(self.symbol)
-        digits = info.digits if info else 2
+        info = mt5.symbol_info(self.symbol)
+        if info is None:
+            logger.error(f"Could not get symbol info for {self.symbol}")
+            return False
+            
+        digits = info.digits
+        tick_size = info.trade_tick_size if info.trade_tick_size > 0 else (10**-digits)
+        
+        # Fetch current values if one is 0 to avoid wiping out existing SL/TP
+        if sl == 0 or tp == 0:
+            positions = mt5.positions_get(ticket=ticket)
+            if positions:
+                p = positions[0]
+                if sl == 0: sl = p.sl
+                if tp == 0: tp = p.tp
+
+        # Strict rounding to tick_size
+        def round_step(val, step):
+            return round(round(val / step) * step, digits)
+
+        final_sl = float(round_step(sl, tick_size)) if sl > 0 else 0.0
+        final_tp = float(round_step(tp, tick_size)) if tp > 0 else 0.0
+
         request = {
             "action":   mt5.TRADE_ACTION_SLTP,
             "position": ticket,
             "symbol":   self.symbol,
-            "sl":       float(round(sl, digits)),
-            "tp":       float(round(tp, digits)),
+            "sl":       final_sl,
+            "tp":       final_tp,
         }
+        
+        logger.info(f"Modifying ticket {ticket}: SL={final_sl} TP={final_tp}")
         result = mt5.order_send(request)
-        if result.retcode != mt5.TRADE_RETCODE_DONE:
-            logger.error(
-                f"Modification failed for ticket {ticket}, "
-                f"retcode={result.retcode}"
-            )
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            rc = mt5.last_error() if result is None else result.retcode
+            logger.error(f"Modification failed for ticket {ticket}, retcode={rc}")
             return False
-        logger.info(f"Position {ticket} modified: SL={sl}, TP={tp}")
+        logger.info(f"Position {ticket} successfully modified.")
         return True
+
+    def modify_sl(self, ticket, sl):
+        return self.modify_position(ticket, sl, 0)
+
+    def modify_tp(self, ticket, tp):
+        return self.modify_position(ticket, 0, tp)
 
     def close_position(self, ticket):
         positions = self.get_positions()

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-train_ensemble_gpu.py - AMD GPU-accelerated 3-Model Ensemble Training Pipeline
+train_ensemble_gpu.py - AMD GPU-accelerated 3-Model LONG-ONLY Binary Ensemble
 
 Uses LightGBM with OpenCL backend for AMD GPUs on Windows (RX 6700 XT).
 Falls back to CPU LightGBM cleanly if GPU is unavailable.
@@ -10,10 +10,9 @@ GPU Backend Priority:
     2. LightGBM with device_type='cpu' (CPU fallback)
     3. sklearn RandomForest (last resort CPU fallback)
 
-Label Encoding Note:
-    LightGBM requires non-negative integer class labels.
-    Our labels (-1, 0, 1) are mapped: -1->0, 0->1, 1->2
-    Probabilities are mapped back to our class scheme for inference.
+Label Encoding (binary):
+    Labels are 0 = WAIT / 1 = LONG from triple-barrier or build_labels().
+    LightGBM binary classification: objective='binary'.
 
 3-Model Architecture:
     1. Trend Model     -> LightGBM (directional bias, MACD/VWAP features)
@@ -21,10 +20,10 @@ Label Encoding Note:
     3. Regime Model    -> LightGBM (volatility/regime detection, ATR/BB features)
 
 Usage:
-    python train_pipeline/train_ensemble_gpu.py         --data train_pipeline/data/xauusd_m1.csv         --horizon 5         --buy-threshold 0.0005         --sell-threshold 0.0005         --expanded-features         --use-gpu         --gpu-backend auto         --out-dir train_pipeline/models_gpu
+    python train_pipeline/train_ensemble_gpu.py         --data train_pipeline/data/xauusd_m1_tb.csv         --label-col tb_label         --expanded-features         --use-gpu         --gpu-backend auto         --out-dir train_pipeline/models_gpu
 
-    # CPU fallback (if no GPU available):
-    python train_pipeline/train_ensemble_gpu.py         --data train_pipeline/data/xauusd_m1.csv         --out-dir train_pipeline/models_gpu
+    # Simple binary labels with default thresholds:
+    python train_pipeline/train_ensemble_gpu.py         --data train_pipeline/data/xauusd_m1.csv         --horizon 5         --long-threshold 0.0005         --expanded-features         --use-gpu         --out-dir train_pipeline/models_gpu
 """
 
 import argparse
@@ -73,16 +72,14 @@ logging.basicConfig(
 logger = logging.getLogger("TrainGPU")
 
 # ==========================================================================='
-# LABEL ENCODING (LightGBM requires 0-indexed integer labels)
+# LABEL ENCODING (binary: 0=WAIT, 1=LONG)
 # ==========================================================================='
 
-LABEL_MAP = {-1: 0, 0: 1, 1: 2}        # our -> lgb
-LABEL_UNMAP = {0: -1, 1: 0, 2: 1}      # lgb -> our
-LABEL_NAMES = ["SELL", "HOLD", "BUY"]  # lgb class 0, 1, 2
+LABEL_NAMES = ["WAIT", "LONG"]
 
 
 def encode_labels(y: pd.Series) -> np.ndarray:
-    return np.array([LABEL_MAP[v] for v in y])
+    return y.values.astype(int)
 
 
 # ==========================================================================='
@@ -105,11 +102,10 @@ def detect_gpu_backend(requested_backend: str, use_gpu: bool) -> tuple:
         try:
             probe_data = lgb.Dataset(
                 np.random.randn(100, 5).astype(np.float32),
-                label=np.random.randint(0, 3, 100)
+                label=np.random.randint(0, 2, 100)
             )
             probe_params = {
-                "objective": "multiclass",
-                "num_class": 3,
+                "objective": "binary",
                 "device_type": "gpu",
                 "verbose": -1,
                 "num_leaves": 4,
@@ -284,8 +280,8 @@ def build_features(df: pd.DataFrame, lookback: int = 10, expanded: bool = False,
     return pd.DataFrame(rows, columns=cols)
 
 
-def build_labels(df, lookback=10, horizon=5, buy_threshold=0.0005, sell_threshold=0.0005) -> pd.Series:
-    """Sync labels with the lookback shift in build_features."""
+def build_labels(df, lookback=10, horizon=5, long_threshold=0.0005) -> pd.Series:
+    """Sync labels with the lookback shift in build_features. Binary: 0=WAIT, 1=LONG."""
     close = df["close"].values
     n = len(close)
     labels = []
@@ -297,7 +293,7 @@ def build_labels(df, lookback=10, horizon=5, buy_threshold=0.0005, sell_threshol
             labels.append(np.nan)
         else:
             ret = (close[fi] - close[i]) / close[i]
-            labels.append(1 if ret > buy_threshold else (-1 if ret < -sell_threshold else 0))
+            labels.append(1 if ret > long_threshold else 0)
     return pd.Series(labels, name="label")
 
 
@@ -321,11 +317,10 @@ def compute_sample_weights(y: pd.Series) -> np.ndarray:
 # ==========================================================================='
 
 
-def get_lgbm_params(role: str, device_type: str, n_classes: int = 3) -> dict:
-    """Each model has purpose-tuned hyperparameters."""
+def get_lgbm_params(role: str, device_type: str) -> dict:
+    """Each model has purpose-tuned hyperparameters. Binary classification."""
     base = {
-        "objective": "multiclass",
-        "num_class": n_classes,
+        "objective": "binary",
         "device_type": device_type,
         "verbose": -1,
         "random_state": 42,
@@ -397,21 +392,21 @@ def get_sklearn_fallback(role: str) -> Pipeline:
 def walk_forward_lgbm(
     X: pd.DataFrame, y: pd.Series, role: str, device_type: str, n_splits: int = 5
 ) -> tuple:
-    """Walk-forward training for LightGBM. Returns (fitted_model, summary)."""
+    """Walk-forward training for LightGBM (binary). Returns (fitted_model, summary)."""
     label = ENSEMBLE_ROLES[role]
     logger.info(f"\n{'='*65}\n  Training [{role}]: {label} | device={device_type}\n{'='*65}")
 
     tscv = TimeSeriesSplit(n_splits=n_splits)
     fold_metrics = []
     last_model = None
-    y_enc = encode_labels(y)
+    y_enc = y.values.astype(int)
 
     for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
         X_train = X.iloc[train_idx].astype(np.float32).values
         X_val   = X.iloc[val_idx].astype(np.float32).values
         y_train_enc, y_val_enc = y_enc[train_idx], y_enc[val_idx]
 
-        # weights based on original labels
+        # weights based on class imbalance
         y_train_orig = y.iloc[train_idx].reset_index(drop=True)
         sample_weight = compute_sample_weights(y_train_orig)
 
@@ -429,33 +424,30 @@ def walk_forward_lgbm(
             callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)],
         )
 
-        proba = model.predict(X_val)  # shape (n_val, 3)
-        if proba.ndim == 1:
-            proba = proba.reshape(-1, 3)
-        y_pred_enc = np.argmax(proba, axis=1)
-        y_pred = np.array([LABEL_UNMAP[c] for c in y_pred_enc])
-        y_val_orig = np.array([LABEL_UNMAP[c] for c in y_val_enc])
+        proba = model.predict(X_val)  # shape (n_val,) for binary
+        y_pred = (proba >= 0.5).astype(int)
+        y_val_orig = y_val_enc
 
         acc = accuracy_score(y_val_orig, y_pred)
-        f1 = f1_score(y_val_orig, y_pred, average="macro", zero_division=0)
-        cm = confusion_matrix(y_val_orig, y_pred, labels=[-1, 0, 1])
+        f1 = f1_score(y_val_orig, y_pred, average="binary", zero_division=0)
+        cm = confusion_matrix(y_val_orig, y_pred, labels=[0, 1])
         report = classification_report(
-            y_val_orig, y_pred, labels=[-1, 0, 1],
-            target_names=["SELL", "HOLD", "BUY"], zero_division=0
+            y_val_orig, y_pred, labels=[0, 1],
+            target_names=LABEL_NAMES, zero_division=0
         )
 
         logger.info(
             f"\n  [{role}] Fold {fold + 1}/{n_splits} | "
             f"Train: {len(X_train):,}  Val: {len(X_val):,}\n"
-            f"  Accuracy: {acc:.4f}  Macro F1: {f1:.4f}\n"
+            f"  Accuracy: {acc:.4f}  Binary F1: {f1:.4f}\n"
             f"  Confusion Matrix:\n{cm}\n{report}"
         )
 
-        fold_metrics.append({"fold": fold + 1, "accuracy": acc, "macro_f1": f1})
+        fold_metrics.append({"fold": fold + 1, "accuracy": acc, "binary_f1": f1})
         last_model = model
 
     acc_mean = np.mean([m["accuracy"] for m in fold_metrics])
-    f1_mean = np.mean([m["macro_f1"] for m in fold_metrics])
+    f1_mean = np.mean([m["binary_f1"] for m in fold_metrics])
     logger.info(f"  [{role}] AGGREGATE -> Mean Acc: {acc_mean:.4f} | Mean F1: {f1_mean:.4f}")
 
     summary = {
@@ -466,7 +458,7 @@ def walk_forward_lgbm(
         "micro": any("tick" in str(f) for f in X.columns),
         "n_splits": n_splits,
         "mean_accuracy": acc_mean,
-        "mean_macro_f1": f1_mean,
+        "mean_binary_f1": f1_mean,
         "fold_detail": fold_metrics,
     }
     return last_model, summary
@@ -490,9 +482,9 @@ def walk_forward_sklearn(
         y_pred = pipeline.predict(X_val)
 
         acc = accuracy_score(y_val, y_pred)
-        f1 = f1_score(y_val, y_pred, average="macro", zero_division=0)
+        f1 = f1_score(y_val, y_pred, average="binary", zero_division=0)
         logger.info(f"  [{role}] Fold {fold+1} | Acc: {acc:.4f} | F1: {f1:.4f}")
-        fold_metrics.append({"fold": fold + 1, "accuracy": acc, "macro_f1": f1})
+        fold_metrics.append({"fold": fold + 1, "accuracy": acc, "binary_f1": f1})
         last_pipeline = pipeline
 
     summary = {
@@ -500,7 +492,7 @@ def walk_forward_sklearn(
         "backend": "sklearn_cpu",
         "n_splits": n_splits,
         "mean_accuracy": np.mean([m["accuracy"] for m in fold_metrics]),
-        "mean_macro_f1": np.mean([m["macro_f1"] for m in fold_metrics]),
+        "mean_binary_f1": np.mean([m["binary_f1"] for m in fold_metrics]),
         "fold_detail": fold_metrics,
     }
     return last_pipeline, summary
@@ -519,8 +511,7 @@ def save_lgbm_model(
     out_dir: str,
     expanded: bool,
     horizon: int,
-    buy_thr: float,
-    sell_thr: float,
+    long_thr: float,
     device_type: str,
     lookback: int,
 ):
@@ -543,10 +534,9 @@ def save_lgbm_model(
                 "expanded_features": expanded,
                 "microstructure_features": summary.get("micro", False),
                 "label_horizon": horizon,
-                "buy_threshold": buy_thr,
-                "sell_threshold": sell_thr,
-                "label_map": LABEL_MAP,
-                "label_unmap": {str(k): v for k, v in LABEL_UNMAP.items()},
+                "long_threshold": long_thr,
+                "classification": "binary",
+                "class_names": LABEL_NAMES,
                 "backend": "lightgbm",
                 "device_type": device_type,
             },
@@ -571,8 +561,7 @@ def save_sklearn_model(
     out_dir: str,
     expanded: bool,
     horizon: int,
-    buy_thr: float,
-    sell_thr: float,
+    long_thr: float,
     lookback: int,
 ):
     import joblib
@@ -594,8 +583,9 @@ def save_sklearn_model(
                 "expanded_features": expanded,
                 "microstructure_features": summary.get("micro", False),
                 "label_horizon": horizon,
-                "buy_threshold": buy_thr,
-                "sell_threshold": sell_thr,
+                "long_threshold": long_thr,
+                "classification": "binary",
+                "class_names": LABEL_NAMES,
                 "backend": "sklearn_cpu",
             },
             f,
@@ -618,8 +608,7 @@ def save_ensemble_metadata(
     gpu_active: bool,
     backend: str,
     horizon: int,
-    buy_thr: float,
-    sell_thr: float,
+    long_thr: float,
     lookback: int,
 ):
     meta_path = os.path.join(out_dir, "ensemble_metadata.json")
@@ -636,9 +625,9 @@ def save_ensemble_metadata(
                 "expanded_features": expanded,
                 "microstructure_features": "micro" in out_dir.lower() or any("vprof" in f for f in feature_names),
                 "label_horizon": horizon,
-                "buy_threshold": buy_thr,
-                "sell_threshold": sell_thr,
-                "label_map": LABEL_MAP,
+                "long_threshold": long_thr,
+                "classification": "binary",
+                "class_names": LABEL_NAMES,
             },
             f,
             indent=2,
@@ -653,13 +642,12 @@ def save_ensemble_metadata(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="AMD GPU 3-Model Ensemble Training — LightGBM OpenCL with CPU fallback"
+        description="AMD GPU 3-Model LONG-ONLY Binary Ensemble Training — LightGBM OpenCL with CPU fallback"
     )
     parser.add_argument("--data",              required=True)
     parser.add_argument("--horizon",           type=int,   default=5)
     parser.add_argument("--lookback",          type=int,   default=10)
-    parser.add_argument("--buy-threshold",     type=float, default=0.0005)
-    parser.add_argument("--sell-threshold",    type=float, default=0.0005)
+    parser.add_argument("--long-threshold",    type=float, default=0.0005)
     parser.add_argument("--label-col",         type=str,   default=None, help="Use existing label column from CSV")
     parser.add_argument("--expanded-features", action="store_true")
     parser.add_argument("--microstructure-features", action="store_true", help="Include microstructure columns if present in data")
@@ -677,15 +665,14 @@ def main():
     suffix = "expanded" if args.expanded_features else "default"
 
     logger.info("=" * 65)
-    logger.info("  XAUUSD GPU Ensemble Training (LightGBM + AMD OpenCL)")
+    logger.info("  XAUUSD GPU LONG-ONLY Binary Ensemble Training (LightGBM + AMD OpenCL)")
     logger.info("=" * 65)
     logger.info(f"  Data          : {args.data}")
     if args.label_col:
         logger.info(f"  Label Column  : {args.label_col}")
     else:
         logger.info(f"  Horizon       : {args.horizon} bars")
-        logger.info(f"  Buy threshold : {args.buy_threshold:.4%}")
-        logger.info(f"  Sell threshold: {args.sell_threshold:.4%}")
+        logger.info(f"  Long threshold: {args.long_threshold:.4%}")
     logger.info(f"  Lookback      : {args.lookback} bars")
     logger.info(f"  Features      : {suffix}")
     logger.info(f"  GPU requested : {args.use_gpu}")
@@ -711,11 +698,10 @@ def main():
 
     if args.label_col:
         logger.info(f"Using existing labels from column: {args.label_col}")
-        # Need to align labels with feature matrix shift (lookback-1)
         y = df[args.label_col].iloc[args.lookback - 1:].reset_index(drop=True)
     else:
         logger.info("Building labels...")
-        y = build_labels(df, lookback=args.lookback, horizon=args.horizon, buy_threshold=args.buy_threshold, sell_threshold=args.sell_threshold)
+        y = build_labels(df, lookback=args.lookback, horizon=args.horizon, long_threshold=args.long_threshold)
     
     valid_mask = y.notna()
     X = X[valid_mask].reset_index(drop=True)
@@ -728,7 +714,7 @@ def main():
         if backend == "lightgbm" and LIGHTGBM_AVAILABLE:
             model, summary = walk_forward_lgbm(X, y, role, device_type, args.n_splits)
             logger.info(f"\nRefitting [{role}] on full dataset...")
-            y_enc = encode_labels(y)
+            y_enc = y.values.astype(int)
             full_weight = compute_sample_weights(y)
             params = get_lgbm_params(role, device_type)
             n_est = params.pop("n_estimators", 500)
@@ -742,8 +728,7 @@ def main():
                 args.out_dir,
                 args.expanded_features,
                 args.horizon,
-                args.buy_threshold,
-                args.sell_threshold,
+                args.long_threshold,
                 device_type,
                 args.lookback,
             )
@@ -758,8 +743,7 @@ def main():
                 args.out_dir,
                 args.expanded_features,
                 args.horizon,
-                args.buy_threshold,
-                args.sell_threshold,
+                args.long_threshold,
                 args.lookback,
             )
 
@@ -774,8 +758,7 @@ def main():
         gpu_active,
         backend,
         args.horizon,
-        args.buy_threshold,
-        args.sell_threshold,
+        args.long_threshold,
         args.lookback,
     )
 

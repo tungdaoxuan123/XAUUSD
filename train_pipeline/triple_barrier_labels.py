@@ -1,44 +1,40 @@
 #!/usr/bin/env python3
 """
-triple_barrier_labels.py
-------------------------
-Replace the current fixed-horizon {BUY, HOLD, SELL} labels with
-López de Prado's Triple-Barrier Method + Meta-Labeling.
+triple_barrier_labels.py — LONG-ONLY binary edition
+---------------------------------------------------
+Path-aware, volatility-scaled labels for a BUY/LONG-only strategy with
+fixed 2:1 risk-reward ratio.
 
-Why it beats your current labeling
-----------------------------------
-Your `build_labels()` in train_ensemble_gpu.py uses:
+Every bar is evaluated as a potential LONG entry only. The outcome is
+binary: 0 = wait (no long trade), 1 = valid long entry.
 
-    label = 1 if ret(h=5) > 0.0005 else (-1 if ret < -0.0005 else 0)
+Why long-only triple-barrier
+----------------------------
+The old 3-class {-1, 0, +1} labeling forced the model to spend capacity
+distinguishing bearish continuation from neutral chop. Both are now
+collapsed into class 0 ("do nothing"), producing cleaner gradients,
+tighter confidence estimates, and an execution layer that never opens
+shorts.
 
-Problems:
-  * Fixed horizon ignores the path — you label a +10 pip outcome even if
-    you would have stopped out at -30 pips first.
-  * Symmetric thresholds ignore realized volatility (ATR). In calm markets
-    nothing is actionable; in news spikes, everything is a 1.
-  * Same threshold for XAUUSD across all regimes biases the model.
+Fixed 2:1 RR with dynamic pip distance
+--------------------------------------
+Stop distance is ATR-scaled (--sl-atr) and take profit is exactly twice
+that value (--pt-atr = 2 * --sl-atr). This preserves a hard 2:1 ratio
+while allowing the actual pip distance to expand and contract with
+market volatility. On quiet sessions ATR contracts → tighter stops and
+smaller targets; during high-volatility moves ATR expands → the trade
+gets more room automatically.
 
-Triple-Barrier fixes all three by simulating a *real* trade: an upper
-barrier (take-profit), a lower barrier (stop-loss), and a vertical
-barrier (timeout). The label is the *first* barrier hit.
-
-Cost model (v2)
----------------
-All barriers are computed from the *deteriorated* entry price (ask for
-longs, bid for shorts) and all exit checks compare against the
-*deteriorated* exit price (bid for long TP/SL, ask for short TP/SL).
-
-This means:
-  * TP requires MORE momentum to hit (correct — harder to win)
-  * SL requires LESS of an adverse move to hit (correct — easier to lose)
-  * Commission is expressed as synthetic spread widening so the math is
-    internally consistent and not just a patch on the raw barriers.
+Cost model
+----------
+All barriers use the deteriorated entry price (ask for longs) and
+deteriorated exit checks (bid for long TP/SL). Commission is expressed
+as synthetic spread widening so the math is internally consistent.
 
 Cost constants
 --------------
-  COMMISSION_PIPS = 0.00006   FTMO raw account: $6/lot round-trip on GBPUSD
-                               ($3/lot/side * 2 sides = $6 = 0.6 pips)
-  DEFAULT_SPREAD  = 0.00008   0.8 pip fallback when cs_spread column absent
+  COMMISSION_PIPS = 0.00006   FTMO raw account: $6/lot round-trip
+  DEFAULT_SPREAD  = 0.00008   0.8 pip fallback
 
 Spread column resolution order
 -------------------------------
@@ -46,20 +42,20 @@ Spread column resolution order
 
 Usage
 -----
-    # 1. Make triple-barrier labels
+    # 1. Make long-only triple-barrier labels (default 2:1 RR)
     python train_pipeline/triple_barrier_labels.py \\
         --data train_pipeline/data/xauusd_m1_synmicro.csv \\
         --out  train_pipeline/data/xauusd_m1_tb.csv \\
-        --pt-atr 1.5 \\
+        --pt-atr 2.0 \\
         --sl-atr 1.0 \\
         --max-hold 30
 
-    # 2. Train primary model on labels as before
+    # 2. Train binary primary model on labels
     python train_pipeline/train_ensemble_gpu.py \\
         --data train_pipeline/data/xauusd_m1_tb.csv \\
         --label-col tb_label ...
 
-    # 3. Train meta filter (after primary predictions are available)
+    # 3. Train binary meta filter (after primary predictions are available)
     python train_pipeline/triple_barrier_labels.py --meta \\
         --data  train_pipeline/data/xauusd_m1_tb.csv \\
         --preds train_pipeline/reports/primary_preds.csv \\
@@ -129,46 +125,29 @@ def _resolve_spread_series(df: pd.DataFrame) -> pd.Series:
 
 def triple_barrier_labels(
     df: pd.DataFrame,
-    pt_atr: float = 1.5,
+    pt_atr: float = 2.0,
     sl_atr: float = 1.0,
     max_hold: int = 30,
     side_col: str | None = None,
 ) -> pd.DataFrame:
-    """Compute triple-barrier outcomes for each bar.
+    """Compute LONG-ONLY triple-barrier outcomes for each bar.
 
-    Barriers (cost-adjusted, v2)
-    ----------------------------
-    All barrier levels and hit-checks account for the bid/ask spread and
-    round-trip commission.  Entry is at the worse price (ask for longs,
-    bid for shorts); exit checks compare against the worse exit price
-    (bid for longs, ask for shorts).
+    Barriers (cost-adjusted)
+    ------------------------
+    entry_ask = close[i] + half_spread
+    upper     = entry_ask + pt_atr * ATR[i]   (TP)
+    lower     = entry_ask - sl_atr * ATR[i]   (SL)
 
-    effective_spread = cs_spread[i] + COMMISSION_PIPS
-    half_spread      = effective_spread / 2
+    TP hit when  high[j] - half_spread >= upper
+    SL hit when  low[j]  - half_spread <= lower
 
-    Long:
-        entry_ask = close[i] + half_spread
-        upper     = entry_ask + pt_atr * ATR[i]   (TP — further away)
-        lower     = entry_ask - sl_atr * ATR[i]   (SL — closer to bid)
-        TP hit when  high[j] - half_spread >= upper
-        SL hit when  low[j]  - half_spread <= lower
+    Outcome mapping (binary):
+        1  = valid long trade (TP hit first)
+        0  = wait / do nothing (SL hit or timeout)
 
-    Short:
-        entry_bid = close[i] - half_spread
-        upper     = entry_bid - pt_atr * ATR[i]   (TP at lower price)
-        lower     = entry_bid + sl_atr * ATR[i]   (SL at higher price)
-        TP hit when  low[j]  + half_spread <= upper
-        SL hit when  high[j] + half_spread >= lower
-
-    If `side_col` is provided (primary model's +/-1 signals), barriers are
-    mirrored for shorts and the label becomes the meta-labeling target:
-        +1  trade profitable (TP barrier hit first)
-         0  vertical barrier expired
-        -1  adverse barrier hit first
-
-    If `side_col` is None, a long-side default is used and the three-class
-    label (-1/0/+1) matches your existing convention but is now path-aware,
-    volatility-scaled, and cost-adjusted.
+    All entries are evaluated as long candidates only. Short-side
+    evaluation has been removed. If `side_col` is provided, only +1
+    entries are evaluated.
     """
     required = {"close", "high", "low", "ATR"}
     missing = required - set(df.columns)
@@ -195,28 +174,19 @@ def triple_barrier_labels(
 
     for i in range(n):
         s = side[i]
-        if s == 0:
+        if s <= 0:
             continue
         atr_i = atr[i]
         if np.isnan(atr_i) or atr_i <= 0:
             continue
 
-        # --- Cost model ---------------------------------------------------
         effective_spread = spread_arr[i] + COMMISSION_PIPS
         half_spread      = effective_spread / 2.0
 
-        if s > 0:
-            # Long: enter at ask, exit (TP and SL) at bid
-            entry    = close[i] + half_spread
-            upper    = entry + pt_atr * atr_i
-            lower    = entry - sl_atr * atr_i
-        else:
-            # Short: enter at bid, exit (TP and SL) at ask
-            entry    = close[i] - half_spread
-            upper    = entry - pt_atr * atr_i   # TP: price moves down
-            lower    = entry + sl_atr * atr_i   # SL: price moves up
+        entry    = close[i] + half_spread
+        upper    = entry + pt_atr * atr_i
+        lower    = entry - sl_atr * atr_i
 
-        # --- Barrier scan -------------------------------------------------
         end     = min(i + 1 + max_hold, n)
         hit     = -1
         outcome = 0
@@ -224,39 +194,24 @@ def triple_barrier_labels(
         for j in range(i + 1, end):
             hi_j, lo_j = high[j], low[j]
 
-            if s > 0:
-                # Long exit checks — compare against bid
-                high_bid = hi_j - half_spread
-                low_bid  = lo_j - half_spread
-                if high_bid >= upper:
-                    outcome = 1
-                    hit = j
-                    break
-                if low_bid <= lower:
-                    outcome = -1
-                    hit = j
-                    break
-            else:
-                # Short exit checks — compare against ask
-                high_ask = hi_j + half_spread
-                low_ask  = lo_j + half_spread
-                if low_ask <= upper:    # TP: exit at ask, price moved down
-                    outcome = 1
-                    hit = j
-                    break
-                if high_ask >= lower:   # SL: exit at ask, price moved up
-                    outcome = -1
-                    hit = j
-                    break
+            high_bid = hi_j - half_spread
+            low_bid  = lo_j - half_spread
+            if high_bid >= upper:
+                outcome = 1
+                hit = j
+                break
+            if low_bid <= lower:
+                outcome = 0
+                hit = j
+                break
 
         if hit == -1:
-            # Vertical barrier: use sign of terminal return in signal direction
             j       = end - 1
-            ret     = (close[j] - entry) / entry * (1 if s > 0 else -1)
+            ret     = (close[j] - entry) / entry
             outcome = 0
             hit     = j
         else:
-            ret = (close[hit] - entry) / entry * (1 if s > 0 else -1)
+            ret = (close[hit] - entry) / entry
 
         tb_label[i] = outcome
         tb_ret[i]   = ret
@@ -276,20 +231,20 @@ def triple_barrier_labels(
 def meta_labels_from_primary(
     df: pd.DataFrame,
     primary_col: str = "primary_pred",
-    pt_atr: float = 1.5,
+    pt_atr: float = 2.0,
     sl_atr: float = 1.0,
     max_hold: int = 30,
 ) -> pd.DataFrame:
-    """Compute triple-barrier outcomes along the primary model's side.
+    """Compute long-only triple-barrier outcomes along the primary model's side.
 
-    meta_label = 1 if trade hit TP, else 0 (SL or timeout)
+    meta_label = 1 if long trade hit TP, else 0 (SL or timeout)
     This becomes the target for a binary "should we act" filter model.
     """
     if primary_col not in df.columns:
         raise ValueError(f"Primary column '{primary_col}' not found")
     out = triple_barrier_labels(df, pt_atr, sl_atr, max_hold, side_col=primary_col)
     out["meta_label"]  = (out["tb_label"] == 1).astype("int8")
-    out["has_signal"]  = (out[primary_col] != 0).astype("int8")
+    out["has_signal"]  = (out[primary_col] > 0).astype("int8")
     return out
 
 
@@ -334,7 +289,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data",     required=True, help="Input CSV with ATR column")
     p.add_argument("--out",      default=None,  help="Output CSV path")
-    p.add_argument("--pt-atr",   type=float,    default=1.5)
+    p.add_argument("--pt-atr",   type=float,    default=2.0)
     p.add_argument("--sl-atr",   type=float,    default=1.0)
     p.add_argument("--max-hold", type=int,       default=30)
     p.add_argument("--meta",     action="store_true",
@@ -375,10 +330,15 @@ def main():
     out_path = args.out or args.data.replace(".csv", "_tb.csv")
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(out_path, index=False)
-    logger.info(f"Saved {len(out):,} rows with triple-barrier labels -> {out_path}")
+    logger.info(f"Saved {len(out):,} rows with long-only triple-barrier labels -> {out_path}")
     if "tb_label" in out.columns:
         vc = out["tb_label"].value_counts().to_dict()
-        logger.info(f"Label distribution: {vc}")
+        n_one = vc.get(1, 0)
+        n_total = vc.get(0, 0) + n_one
+        logger.info(
+            f"Label distribution: {vc}  "
+            f"(positive rate: {n_one / max(n_total, 1):.1%})"
+        )
         logger.info(
             f"[CostModel] COMMISSION_PIPS={COMMISSION_PIPS} "
             f"DEFAULT_SPREAD={DEFAULT_SPREAD}"

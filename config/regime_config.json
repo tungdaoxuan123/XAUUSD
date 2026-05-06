@@ -1,0 +1,128 @@
+{
+  "regime_detection": {
+    "method": "adx_volatility_trend",
+    "adx_period": 14,
+    "volatility_period": 20,
+    "trend_period": 50,
+    "update_frequency": "daily"
+  },
+  "regime_parameters": {
+    "strong_bull": {
+      "adx_min": 25,
+      "trend_strength": 0.7,
+      "volatility_max": 0.015,
+      "profit_targets": [0.015, 0.03, 0.06, 0.12],
+      "stop_loss": 0.03,
+      "trailing_stop": 0.025,
+      "position_size_multiplier": 1.5,
+      "max_hold_time": 20,
+      "entry_confidence_threshold": 0.6,
+      "description": "Strong upward trend with high momentum"
+    },
+    "bull_trend": {
+      "adx_min": 20,
+      "adx_max": 25,
+      "trend_strength": 0.5,
+      "volatility_max": 0.02,
+      "profit_targets": [0.01, 0.02, 0.05, 0.10],
+      "stop_loss": 0.025,
+      "trailing_stop": 0.02,
+      "position_size_multiplier": 1.2,
+      "max_hold_time": 15,
+      "entry_confidence_threshold": 0.65,
+      "description": "Moderate upward trend"
+    },
+    "bear_trend": {
+      "adx_min": 20,
+      "adx_max": 25,
+      "trend_strength": -0.5,
+      "volatility_max": 0.02,
+      "profit_targets": [0.008, 0.015, 0.03, 0.06],
+      "stop_loss": 0.02,
+      "trailing_stop": 0.015,
+      "position_size_multiplier": 0.8,
+      "max_hold_time": 12,
+      "entry_confidence_threshold": 0.7,
+      "description": "Moderate downward trend"
+    },
+    "strong_bear": {
+      "adx_min": 25,
+      "trend_strength": -0.7,
+      "volatility_max": 0.015,
+      "profit_targets": [0.005, 0.01, 0.02, 0.04],
+      "stop_loss": 0.025,
+      "trailing_stop": 0.02,
+      "position_size_multiplier": 0.6,
+      "max_hold_time": 10,
+      "entry_confidence_threshold": 0.75,
+      "description": "Strong downward trend with high momentum"
+    },
+    "ranging": {
+      "adx_max": 20,
+      "trend_strength": [-0.3, 0.3],
+      "volatility_max": 0.025,
+      "profit_targets": [0.008, 0.015, 0.03, 0.06],
+      "stop_loss": 0.015,
+      "trailing_stop": 0.01,
+      "position_size_multiplier": 0.7,
+      "max_hold_time": 8,
+      "entry_confidence_threshold": 0.8,
+      "description": "Sideways market with low trend strength"
+    },
+    "high_volatility": {
+      "volatility_min": 0.025,
+      "profit_targets": [0.02, 0.04, 0.08, 0.15],
+      "stop_loss": 0.04,
+      "trailing_stop": 0.03,
+      "position_size_multiplier": 0.6,
+      "max_hold_time": 5,
+      "entry_confidence_threshold": 0.85,
+      "description": "High volatility environment requiring quick exits"
+    }
+  },
+  "regime_transition": {
+    "min_regime_duration": 5,
+    "transition_smoothing": 0.3,
+    "confirmation_period": 3,
+    "override_conditions": {
+      "extreme_volatility": 0.05,
+      "flash_crash": -0.1,
+      "gap_threshold": 0.03
+    }
+  },
+  "performance_tracking": {
+    "regime_win_rates": {
+      "strong_bull": 0.652,
+      "bull_trend": 0.618,
+      "bear_trend": 0.521,
+      "strong_bear": 0.489,
+      "ranging": 0.521,
+      "high_volatility": 0.489
+    },
+    "regime_avg_wins": {
+      "strong_bull": 62.34,
+      "bull_trend": 54.21,
+      "bear_trend": 38.92,
+      "strong_bear": 32.15,
+      "ranging": 38.92,
+      "high_volatility": 45.67
+    },
+    "regime_sharpe_ratios": {
+      "strong_bull": 2.5,
+      "bull_trend": 2.2,
+      "bear_trend": 1.8,
+      "strong_bear": 1.5,
+      "ranging": 1.9,
+      "high_volatility": 1.6
+    }
+  },
+  "adaptive_features": {
+    "parameter_adjustment": true,
+    "confidence_weighting": true,
+    "volatility_scaling": true,
+    "trend_strength_modulation": true,
+    "learning_rate": 0.01
+  },
+  "version": "1.0.0",
+  "last_updated": "2025-10-10"
+}

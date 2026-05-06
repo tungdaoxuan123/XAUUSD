@@ -18,7 +18,7 @@ class Settings:
     INITIAL_BALANCE = 10000.0
     MAX_DAILY_LOSS_PCT = 4.8
     MAX_TOTAL_LOSS_PCT = 9.5
-    MAX_POSITIONS = 3
+    MAX_POSITIONS = 1
     RISK_PER_TRADE_PCT = 0.1 # 0.1% = $10.00 risk
     MAX_LOT_SIZE = 0.03
     DEFAULT_LOT_SIZE = 0.03
@@ -28,11 +28,9 @@ class Settings:
         # Format: {"start": "2024-04-10 12:28", "end": "2024-04-10 12:32"}
     ]
     
-    # Thresholds
+    # Thresholds (long-only)
     BUY_THRESHOLD = 0.5
-    SELL_THRESHOLD = 0.5
     BUY_CONFIDENCE = 0.65
-    SELL_CONFIDENCE = 0.7
     
     # Paths
     ENSEMBLE_MODEL_PATH = os.getenv("ENSEMBLE_MODEL_PATH", "train_pipeline/models_dukas_300b/")
