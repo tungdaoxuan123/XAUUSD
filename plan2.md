@@ -1,39 +1,15 @@
-Bug 1 — Lookback not wired into vectorized feature builder
-In build_features(), the shift loop must use the lookback parameter:
+What's Still Broken ⚠️
+1. build_labels() still uses fixed-horizon return — unchanged.
+This is the same issue from the last review. (close[fi] - close[i]) / close[i] > long_threshold ignores path. This only matters when someone runs without a pre-labeled CSV. If you always pass --label-col tb_label with a triple-barrier labeled file, this never executes. Recommendation: add a hard warning log when build_labels() is called so it's never used silently in production.
 
-python
-# Wrong — hardcoded range:
-for i in range(10):
-    X[f"return_lag_{i}"] = ...
+2. sample_weight removed from walk_forward_lgbm().
+The previous version computed compute_sample_weights() per fold and passed it to lgb.Dataset(..., weight=sample_weight). The new version removed this — lgb.Dataset(X_train, label=y_train_enc) has no weight arg. The scale_pos_weight in MODEL_CONFIGS partially compensates, but per-sample uniqueness weighting from triple_barrier_labels.py is no longer used at all. For XAUUSD M1 where many consecutive bars have the same label (overlapping triple-barrier windows), this matters.
 
-# Correct — use the passed lookback:
-for i in range(lookback):
-    X[f"return_lag_{i}"] = (
-        (df["close"].shift(i) - df["close"].shift(i + 1)) / df["ATR"].shift(i)
-    ).clip(-10, 10)
-After this fix, with --lookback 60 you should see return_lag_0 through return_lag_59 — 60 features just from price lags, plus the 16 indicator/micro features = ~76 total.
+3. feature_names undefined in sklearn fallback path.
+In main(), the sklearn branch calls save_sklearn_model(..., feature_names, ...) but feature_names is never defined in scope. This will crash with NameError: name 'feature_names' is not defined if LightGBM is unavailable. Should be all_feature_names or get_all_feature_names().
 
-Bug 2 — scale_pos_weight is now too low (or zero)
-The correct value for a 2:1 class imbalance (1M WAIT vs 512K LONG) is not 1.0 and not 2.0. It is 1.3 — a gentle partial rebalance. Set this explicitly in get_lgbm_params() for all three roles and make absolutely sure nothing overrides it afterward:
+4. ensemble_metadata.json still missing "side" tag.
+save_ensemble_metadata() writes classification: "binary" and class_names: ["WAIT", "LONG"] but has no "side": "long" field. When you build the SELL model mirror, the dispatcher loading both binaries cannot distinguish them from metadata alone.
 
-python
-# In get_lgbm_params(), add to base dict:
-"scale_pos_weight": 1.3,
-
-# In walk_forward_lgbm() — DELETE these lines entirely:
-n_neg = (y_train_enc == 0).sum()
-n_pos = max((y_train_enc == 1).sum(), 1)
-params["scale_pos_weight"] = n_neg / n_pos   # ← DELETE
-
-# In main() refit block — DELETE these lines entirely:
-n_neg_full = (y_enc == 0).sum()
-n_pos_full = max((y_enc == 1).sum(), 1)
-params["scale_pos_weight"] = n_neg_full / n_pos_full  # ← DELETE
-Also remove weight=sample_weight from both lgb.Dataset() calls. Using both scale_pos_weight AND sample_weight simultaneously is the root cause of the oscillation between always-LONG and always-WAIT.
-
-Expected After Both Fixes
-text
-Features: 76  ← 60 return lags + 16 indicators/micro
-[trend]     Fold 1 | Acc: ~0.61  F1: ~0.57  LONG recall: ~0.58
-[structure] Fold 1 | Acc: ~0.58  F1: ~0.54  LONG recall: ~0.55
-[regime]    Fold 1 | Acc: ~0.55  F1: ~0.51  LONG recall: ~0.52
+5. structure model features depend entirely on synmicro columns.
+MODEL_CONFIGS["structure"]["features"] is ["ofi_window", "tick_imbalance", "cs_spread", "kyle_lambda", "vprof_poc_dist", "amihud"] — all six are synmicro columns. If someone runs without synmicro data, all six will be 0.0 (the fallback fill), and the structure model will train on a constant feature matrix. There's a logger.warning for missing features, but no hard fail. This should at minimum log a clear ERROR if more than 50% of a role's features are zero-filled.

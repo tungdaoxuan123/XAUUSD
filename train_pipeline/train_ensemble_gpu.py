@@ -412,17 +412,27 @@ def get_sklearn_fallback(role: str) -> Pipeline:
 
 
 def walk_forward_lgbm(
-    X: pd.DataFrame, y: pd.Series, role: str, device_type: str, n_splits: int = 5
+    X: pd.DataFrame, y: pd.Series, role: str, device_type: str, n_splits: int = 5,
+    sample_weight: pd.Series = None,
 ) -> tuple:
     """Walk-forward training for LightGBM (binary). Uses per-role feature subset from MODEL_CONFIGS."""
     label = ENSEMBLE_ROLES[role]
     role_features = MODEL_CONFIGS[role]["features"]
-    # Select only the columns this role needs
     available = [f for f in role_features if f in X.columns]
     missing = [f for f in role_features if f not in X.columns]
     if missing:
         logger.warning(f"[{role}] Missing features: {missing}")
     X_role = X[available]
+    n_zero_filled = 0
+    for f in available:
+        vals = X_role[f].values if hasattr(X_role[f], "values") else X_role[f]
+        if isinstance(vals, np.ndarray) and np.all(np.abs(vals) < 1e-9):
+            n_zero_filled += 1
+    if n_zero_filled > len(available) * 0.5 and len(available) > 0:
+        logger.error(
+            f"[{role}] {n_zero_filled}/{len(available)} features are zero-filled! "
+            f"Run synthetic_microstructure.py first."
+        )
     logger.info(f"\n{'='*65}\n  Training [{role}]: {label} | device={device_type}")
     logger.info(f"  Features ({len(available)}): {available}")
 
@@ -430,6 +440,7 @@ def walk_forward_lgbm(
     fold_metrics = []
     last_model = None
     y_enc = y.values.astype(int)
+    sw = sample_weight.values.astype("float32") if sample_weight is not None else None
 
     for fold, (train_idx, val_idx) in enumerate(tscv.split(X_role)):
         X_train = X_role.iloc[train_idx].astype(np.float32).values
@@ -439,7 +450,10 @@ def walk_forward_lgbm(
         params = get_lgbm_params(role, device_type)
         n_est = params.pop("n_estimators", 500)
 
-        train_data = lgb.Dataset(X_train, label=y_train_enc)
+        if sw is not None:
+            train_data = lgb.Dataset(X_train, label=y_train_enc, weight=sw[train_idx])
+        else:
+            train_data = lgb.Dataset(X_train, label=y_train_enc)
         val_data = lgb.Dataset(X_val, label=y_val_enc, reference=train_data)
 
         model = lgb.train(
@@ -634,6 +648,7 @@ def save_ensemble_metadata(
     horizon: int,
     long_thr: float,
     lookback: int,
+    side: str = "long",
 ):
     meta_path = os.path.join(out_dir, "ensemble_metadata.json")
     with open(meta_path, "w") as f:
@@ -647,8 +662,10 @@ def save_ensemble_metadata(
                 "label_horizon": horizon,
                 "long_threshold": long_thr,
                 "classification": "binary",
+                "side": side,
                 "class_names": LABEL_NAMES,
-                "model_configs": {r: MODEL_CONFIGS[r] for r in model_paths},
+                "model_configs": {r: {k: v for k, v in MODEL_CONFIGS[r].items() if k != "features"}
+                                  for r in model_paths},
             },
             f,
             indent=2,
@@ -678,6 +695,8 @@ def parse_args():
     )
     parser.add_argument("--n-splits",          type=int,   default=5)
     parser.add_argument("--out-dir",           type=str,   default="train_pipeline/models_gpu")
+    parser.add_argument("--side", type=str, default="long", choices=["long", "short"],
+                        help="Trade direction — saved in metadata for bot dispatcher")
     return parser.parse_args()
 
 
@@ -721,6 +740,11 @@ def main():
         logger.info(f"Using existing labels from column: {args.label_col}")
         y = df[args.label_col].iloc[args.lookback:].reset_index(drop=True)
     else:
+        logger.warning("=" * 65)
+        logger.warning("  NO --label-col PROVIDED — using fixed-horizon build_labels()")
+        logger.warning("  This ignores path-dependent outcomes. Use triple_barrier_labels.py")
+        logger.warning("  to generate tb_label and pass --label-col tb_label instead.")
+        logger.warning("=" * 65)
         logger.info("Building labels...")
         y = build_labels(df, lookback=args.lookback, horizon=args.horizon, long_threshold=args.long_threshold)
     
@@ -728,20 +752,27 @@ def main():
     X = X[valid_mask].reset_index(drop=True)
     y = y[valid_mask].reset_index(drop=True).astype(int)
     logger.info(f"Dataset: {len(X):,} rows | Labels: {y.value_counts().sort_index().to_dict()}")
+    if "sample_weight" in df.columns:
+        sw = df["sample_weight"].iloc[args.lookback:].reset_index(drop=True)
+        sw = sw[valid_mask].reset_index(drop=True)
+        logger.info("Using sample_weight column from triple-barrier labels")
+    else:
+        sw = None
+        logger.info("No sample_weight column found — using uniform weights")
 
     # Train all 3 models
     model_paths = {}
     for role in ["trend", "structure", "regime"]:
         if backend == "lightgbm" and LIGHTGBM_AVAILABLE:
-            model, summary = walk_forward_lgbm(X, y, role, device_type, args.n_splits)
+            model, summary = walk_forward_lgbm(X, y, role, device_type, args.n_splits, sample_weight=sw)
             logger.info(f"\nRefitting [{role}] on full dataset...")
             y_enc = y.values.astype(int)
             params = get_lgbm_params(role, device_type)
             n_est = params.pop("n_estimators", 500)
-            # Use only this role's features for full-dataset refit
             role_feats = [f for f in MODEL_CONFIGS[role]["features"] if f in X.columns]
             X_role = X[role_feats].astype(np.float32).values
-            full_data = lgb.Dataset(X_role, label=y_enc)
+            sw_full = sw.values.astype("float32") if sw is not None else None
+            full_data = lgb.Dataset(X_role, label=y_enc, weight=sw_full) if sw_full is not None else lgb.Dataset(X_role, label=y_enc)
             model = lgb.train(params, full_data, num_boost_round=n_est)
             path = save_lgbm_model(
                 model, role, args.out_dir, args.horizon,
@@ -753,7 +784,7 @@ def main():
             pipeline.fit(X, y)
             path = save_sklearn_model(
                 pipeline,
-                feature_names,
+                all_feature_names,
                 summary,
                 role,
                 args.out_dir,
@@ -774,6 +805,7 @@ def main():
         args.horizon,
         args.long_threshold,
         args.lookback,
+        side=args.side,
     )
 
     logger.info("\n" + "=" * 65)
