@@ -72,14 +72,46 @@ logging.basicConfig(
 logger = logging.getLogger("TrainGPU")
 
 # ==========================================================================='
-# LABEL ENCODING (binary: 0=WAIT, 1=LONG)
+# MODEL CONFIGS — each role uses different features & hyperparams (1d)
 # ==========================================================================='
+
+MODEL_CONFIGS = {
+    "trend": {
+        "features": ["return_lag_0", "return_lag_1", "return_lag_2", "return_lag_3",
+                     "return_lag_4", "return_lag_5", "return_lag_6", "return_lag_7",
+                     "return_lag_8", "return_lag_9",
+                     "RSI", "MACD", "MACD_Hist", "Signal_Line",
+                     "atr_norm", "ema_ratio"],
+        "num_leaves": 63, "max_depth": 6, "min_child_samples": 300,
+        "scale_pos_weight": 1.3, "lambda_l1": 0.1, "lambda_l2": 0.1,
+    },
+    "structure": {
+        "features": ["ofi_window", "tick_imbalance", "cs_spread",
+                     "kyle_lambda", "vprof_poc_dist", "amihud"],
+        "num_leaves": 127, "max_depth": 8, "min_child_samples": 100,
+        "scale_pos_weight": 1.3, "lambda_l1": 0.05, "lambda_l2": 0.05,
+    },
+    "regime": {
+        "features": ["atr_pct", "amihud", "jump_flag",
+                     "regime_flag", "vol_zscore"],
+        "num_leaves": 31, "max_depth": 4, "min_child_samples": 500,
+        "scale_pos_weight": 1.2, "lambda_l1": 0.2, "lambda_l2": 0.2,
+    }
+}
 
 LABEL_NAMES = ["WAIT", "LONG"]
 
 
 def encode_labels(y: pd.Series) -> np.ndarray:
     return y.values.astype(int)
+
+
+# All synmicro columns from synthetic_microstructure.py (1c)
+MICRO_COLS = [
+    "tick_imbalance", "ofi_window", "cs_spread",
+    "kyle_lambda", "vprof_poc_dist", "amihud",
+    "jump_flag", "regime_flag",
+]
 
 
 # ==========================================================================='
@@ -202,44 +234,17 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     lc = (df["low"] - close.shift()).abs()
     df["ATR"] = pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(14).mean()
 
+    # Derived features for regime/structure models (1d)
+    df["atr_norm"] = df["ATR"] / (close + 1e-9)                    # ATR as % of price
+    df["atr_pct"]  = df["ATR"].pct_change(20).fillna(0)             # ATR trend
+    df["ema_ratio"] = (close.ewm(span=5, adjust=False).mean() /
+                       close.ewm(span=20, adjust=False).mean()).fillna(1)  # short/long EMA
+    df["vol_zscore"] = ((df["ATR"] - df["ATR"].rolling(100).mean()) /
+                        (df["ATR"].rolling(100).std() + 1e-9)).fillna(0)  # vol regime z-score
+
     df = df.replace([np.inf, -np.inf], np.nan)
-    # Only drop rows where the indicators we just computed are NaN (first 20-30 bars)
-    # This prevents dropping thousands of bars if microstructure data is partially missing.
     indicator_cols = ["RSI", "MACD", "Signal_Line", "ATR", "BB_width", "VWAP"]
     df = df.dropna(subset=[c for c in indicator_cols if c in df.columns]).reset_index(drop=True)
-
-    # ---- Regime / session features (Problem 2) ----
-    # ATR ratio: short-term vs long-term volatility
-    atr_100 = pd.concat([df["high"] - df["low"],
-                         (df["high"] - df["close"].shift()).abs(),
-                         (df["low"] - df["close"].shift()).abs()], axis=1).max(axis=1).rolling(100).mean()
-    df["atr_ratio"] = (df["ATR"] / (atr_100 + 1e-9)).clip(0, 10)
-
-    # ADX
-    tr = pd.concat([df["high"] - df["low"],
-                    (df["high"] - df["close"].shift()).abs(),
-                    (df["low"] - df["close"].shift()).abs()], axis=1).max(axis=1)
-    plus_dm = (df["high"] - df["high"].shift()).clip(lower=0)
-    minus_dm = (df["low"].shift() - df["low"]).clip(lower=0)
-    atr_14 = tr.rolling(14).mean()
-    plus_di = 100 * (plus_dm.rolling(14).mean() / (atr_14 + 1e-9))
-    minus_di = 100 * (minus_dm.rolling(14).mean() / (atr_14 + 1e-9))
-    dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9))
-    df["adx_14"] = dx.rolling(14).mean().fillna(0)
-
-    # Session / time features
-    if "time" in df.columns:
-        dt_idx = pd.to_datetime(df["time"])
-        hour = dt_idx.dt.hour
-    else:
-        hour = pd.Series(0, index=df.index)
-    df["is_london"]  = ((hour >= 7)  & (hour < 16)).astype(int)
-    df["is_ny"]      = ((hour >= 13) & (hour < 21)).astype(int)
-    df["is_overlap"] = ((hour >= 13) & (hour < 16)).astype(int)
-    df["hour_sin"]   = np.sin(2 * np.pi * hour / 24)
-    df["hour_cos"]   = np.cos(2 * np.pi * hour / 24)
-    df["dow"]        = pd.to_datetime(df["time"]).dt.dayofweek if "time" in df.columns else 0
-
     return df
 
 
@@ -247,88 +252,75 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # FEATURES & PROCESSED DATA
 # ==========================================================================='
 
-def get_feature_names(lookback: int, expanded: bool = False, micro: bool = False) -> list:
-    """Generate dynamic feature names based on lookback window."""
-    base = [f"close_lag_{i}" for i in range(lookback - 1, -1, -1)]
-    common = base + ["RSI", "MACD", "Signal_Line", "current_position", "current_balance"]
-    if expanded:
-        common += ["MACD_Hist", "VWAP", "close_minus_vwap", "ATR", "BB_width"]
-        common += ["atr_ratio", "adx_14", "is_london", "is_ny", "is_overlap",
-                   "hour_sin", "hour_cos", "dow"]
-    if micro:
-        common += [
-            "tick_imbalance", "bid_ask_vol_imbalance", "spread_mean", "ofi_window", "of_pressure_flag",
-            "vprof_poc_dist", "vprof_in_value_area", "vprof_hvn_flag", "vprof_lvn_flag"
-        ]
-    return common
+def get_feature_names_for_role(role: str) -> list:
+    """Return the feature list for a specific model role (1d)."""
+    return list(MODEL_CONFIGS[role]["features"])
 
 
-def build_features(df: pd.DataFrame, lookback: int = 10, expanded: bool = False, micro: bool = False) -> pd.DataFrame:
-    """Create feature matrix from indicators with variable price lags."""
-    # List of micro features to extract if present
-    micro_cols = [
-        "tick_imbalance", "bid_ask_vol_imbalance", "spread_mean", "ofi_window", "of_pressure_flag",
-        "vprof_poc_dist", "vprof_in_value_area", "vprof_hvn_flag", "vprof_lvn_flag"
-    ]
-    
-    # Fill NAs for micro features with median + clip (Problem 1)
-    MICRO_COLS = ["tick_imbalance", "ofi_window", "cs_spread", "kyle_lambda",
-                  "vprof_poc_dist", "spread_mean", "bid_ask_vol_imbalance",
-                  "of_pressure_flag", "vprof_in_value_area", "vprof_hvn_flag", "vprof_lvn_flag"]
-    if micro:
-        for col in micro_cols:
-            if col in df.columns:
-                df[col] = df[col].fillna(df[col].median() if df[col].notna().sum() > 0 else 0)
-                if df[col].notna().sum() > 10:
-                    lo = df[col].quantile(0.01)
-                    hi = df[col].quantile(0.99)
-                    if lo < hi:
-                        df[col] = df[col].clip(lo, hi)
-            else:
-                logger.warning(f"Micro feature column {col} missing from data!")
-                df[col] = 0.0
+def get_all_feature_names() -> list:
+    """Union of all feature names across all roles."""
+    seen = set()
+    out = []
+    for role in ["trend", "structure", "regime"]:
+        for f in MODEL_CONFIGS[role]["features"]:
+            if f not in seen:
+                seen.add(f)
+                out.append(f)
+    return out
+
+
+def build_features(df: pd.DataFrame, lookback: int = 10) -> pd.DataFrame:
+    """Create feature matrix with ATR-normalized return lags (1b) + synmicro columns (1c).
+
+    Removes current_position / current_balance (1a).
+    """
+    close = df["close"].values
+    atr   = df["ATR"].values
+    n     = len(df)
+
+    # Fill NaN in synmicro columns from MICRO_COLS (1c)
+    for col in MICRO_COLS:
+        if col in df.columns:
+            df[col] = df[col].fillna(0)
+        else:
+            df[col] = 0.0
 
     rows = []
-    n = len(df)
-    
-    # We start from lookback-1 to have enough data for the first lag set
-    for i in range(lookback - 1, n):
-        price_lags = df["close"].iloc[i - lookback + 1: i + 1].values
+    for i in range(lookback, n):
         latest = df.iloc[i]
-        
-        row = list(price_lags) + [
+
+        # Return lags: normalized by ATR (1b)
+        ret_lags = []
+        for k in range(lookback):
+            lag_i = i - k
+            if lag_i < 1:
+                ret_lags.append(0.0)
+            else:
+                atr_prev = atr[lag_i - 1] if np.isfinite(atr[lag_i - 1]) and atr[lag_i - 1] > 0 else 0.01
+                ret_lags.append((close[lag_i] - close[lag_i - 1]) / atr_prev)
+
+        row = list(ret_lags) + [
             float(latest["RSI"]),
             float(latest["MACD"]),
+            float(latest["MACD_Hist"]),
             float(latest["Signal_Line"]),
-            0.0,      # current_position placeholder
-            10000.0,  # current_balance placeholder
+            float(latest.get("atr_norm", 0)),
+            float(latest.get("ema_ratio", 1)),
+            float(latest.get("atr_pct", 0)),
+            float(latest.get("vol_zscore", 0)),
         ]
-        
-        if expanded:
-            row += [
-                float(latest["MACD_Hist"]),
-                float(latest["VWAP"]),
-                float(latest["close_minus_vwap"]),
-                float(latest["ATR"]),
-                float(latest["BB_width"]),
-                float(latest.get("atr_ratio", 0)),
-                float(latest.get("adx_14", 0)),
-                int(latest.get("is_london", 0)),
-                int(latest.get("is_ny", 0)),
-                int(latest.get("is_overlap", 0)),
-                float(latest.get("hour_sin", 0)),
-                float(latest.get("hour_cos", 0)),
-                int(latest.get("dow", 0)),
-            ]
-            
-        if micro:
-            for col in micro_cols:
-                row.append(float(latest[col]))
-                
+
+        # Synmicro columns — always appended (1c)
+        for col in MICRO_COLS:
+            row.append(float(latest[col]))
+
         rows.append(row)
 
-    cols = get_feature_names(lookback, expanded, micro)
-    return pd.DataFrame(rows, columns=cols)
+    all_names = (["return_lag_{}".format(i) for i in range(lookback)]
+                 + ["RSI", "MACD", "MACD_Hist", "Signal_Line",
+                    "atr_norm", "ema_ratio", "atr_pct", "vol_zscore"]
+                 + MICRO_COLS)
+    return pd.DataFrame(rows, columns=all_names)
 
 
 def build_labels(df, lookback=10, horizon=5, long_threshold=0.0005) -> pd.Series:
@@ -336,9 +328,9 @@ def build_labels(df, lookback=10, horizon=5, long_threshold=0.0005) -> pd.Series
     close = df["close"].values
     n = len(close)
     labels = []
-    
-    # Must match the range(lookback-1, n) loop in build_features
-    for i in range(lookback - 1, n):
+
+    # Must match range(lookback, n) in build_features
+    for i in range(lookback, n):
         fi = i + horizon
         if fi >= n:
             labels.append(np.nan)
@@ -369,40 +361,22 @@ def compute_sample_weights(y: pd.Series) -> np.ndarray:
 
 
 def get_lgbm_params(role: str, device_type: str) -> dict:
-    """Each model has purpose-tuned hyperparameters. Binary classification."""
-    base = {
+    """Hyperparameters from MODEL_CONFIGS (1d)."""
+    cfg = MODEL_CONFIGS[role]
+    return {
         "objective": "binary",
         "device_type": device_type,
         "verbose": -1,
         "random_state": 42,
-        "max_bin": 63,           # CRITICAL for AMD OpenCL
-        "min_child_samples": 100,
-        "reg_alpha": 0.1,
-        "reg_lambda": 1.0,
-        "feature_fraction": 0.8,
-        "bagging_fraction": 0.8,
-        "bagging_freq": 5,
+        "max_bin": 63,
+        "n_estimators": 500,
+        "num_leaves": cfg["num_leaves"],
+        "max_depth": cfg["max_depth"],
+        "min_child_samples": cfg["min_child_samples"],
+        "scale_pos_weight": cfg["scale_pos_weight"],
+        "lambda_l1": cfg["lambda_l1"],
+        "lambda_l2": cfg["lambda_l2"],
     }
-
-    if role == "trend":
-        return {**base,
-            "n_estimators": 500,
-            "num_leaves": 63,
-            "learning_rate": 0.05,
-        }
-    elif role == "structure":
-        return {**base,
-            "n_estimators": 500,
-            "num_leaves": 63,
-            "learning_rate": 0.03,
-        }
-    elif role == "regime":
-        return {**base,
-            "n_estimators": 500,
-            "num_leaves": 63,
-            "learning_rate": 0.02,
-        }
-    return base
 
 
 ENSEMBLE_ROLES = {
@@ -440,18 +414,26 @@ def get_sklearn_fallback(role: str) -> Pipeline:
 def walk_forward_lgbm(
     X: pd.DataFrame, y: pd.Series, role: str, device_type: str, n_splits: int = 5
 ) -> tuple:
-    """Walk-forward training for LightGBM (binary). Returns (fitted_model, summary)."""
+    """Walk-forward training for LightGBM (binary). Uses per-role feature subset from MODEL_CONFIGS."""
     label = ENSEMBLE_ROLES[role]
-    logger.info(f"\n{'='*65}\n  Training [{role}]: {label} | device={device_type}\n{'='*65}")
+    role_features = MODEL_CONFIGS[role]["features"]
+    # Select only the columns this role needs
+    available = [f for f in role_features if f in X.columns]
+    missing = [f for f in role_features if f not in X.columns]
+    if missing:
+        logger.warning(f"[{role}] Missing features: {missing}")
+    X_role = X[available]
+    logger.info(f"\n{'='*65}\n  Training [{role}]: {label} | device={device_type}")
+    logger.info(f"  Features ({len(available)}): {available}")
 
     tscv = TimeSeriesSplit(n_splits=n_splits)
     fold_metrics = []
     last_model = None
     y_enc = y.values.astype(int)
 
-    for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
-        X_train = X.iloc[train_idx].astype(np.float32).values
-        X_val   = X.iloc[val_idx].astype(np.float32).values
+    for fold, (train_idx, val_idx) in enumerate(tscv.split(X_role)):
+        X_train = X_role.iloc[train_idx].astype(np.float32).values
+        X_val   = X_role.iloc[val_idx].astype(np.float32).values
         y_train_enc, y_val_enc = y_enc[train_idx], y_enc[val_idx]
 
         # weights based on class imbalance
@@ -460,11 +442,6 @@ def walk_forward_lgbm(
 
         params = get_lgbm_params(role, device_type)
         n_est = params.pop("n_estimators", 500)
-
-        # Per-fold scale_pos_weight (Problem 5)
-        n_neg = (y_train_enc == 0).sum()
-        n_pos = max((y_train_enc == 1).sum(), 1)
-        params["scale_pos_weight"] = n_neg / n_pos
 
         train_data = lgb.Dataset(X_train, label=y_train_enc, weight=sample_weight)
         val_data = lgb.Dataset(X_val, label=y_val_enc, reference=train_data)
@@ -558,19 +535,17 @@ def walk_forward_sklearn(
 
 def save_lgbm_model(
     model,
-    feature_names: list,
-    summary: dict,
     role: str,
     out_dir: str,
-    expanded: bool,
     horizon: int,
     long_thr: float,
     device_type: str,
     lookback: int,
+    summary: dict = None,
 ):
     os.makedirs(out_dir, exist_ok=True)
-    suffix = "expanded" if expanded else "default"
-    tag = f"{role}_{suffix}"
+    tag = role
+    role_features = [f for f in MODEL_CONFIGS[role]["features"] if len(f) > 0]
 
     model_path = os.path.join(out_dir, f"lgbm_{tag}.txt")
     features_path = os.path.join(out_dir, f"features_{tag}.json")
@@ -581,17 +556,16 @@ def save_lgbm_model(
     with open(features_path, "w") as f:
         json.dump(
             {
-                "feature_names": feature_names,
-                "feature_count": len(feature_names),
+                "feature_names": role_features,
+                "feature_count": len(role_features),
                 "lookback": lookback,
-                "expanded_features": expanded,
-                "microstructure_features": summary.get("micro", False),
                 "label_horizon": horizon,
                 "long_threshold": long_thr,
                 "classification": "binary",
                 "class_names": LABEL_NAMES,
                 "backend": "lightgbm",
                 "device_type": device_type,
+                "role": role,
             },
             f,
             indent=2,
@@ -602,7 +576,10 @@ def save_lgbm_model(
 
     logger.info(f"  Saved model    : {model_path}")
     logger.info(f"  Saved features : {features_path}")
-    logger.info(f"  Saved summary  : {summary_path}")
+    if summary:
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+        logger.info(f"  Saved summary  : {summary_path}")
     return model_path
 
 
@@ -656,8 +633,6 @@ def save_sklearn_model(
 def save_ensemble_metadata(
     out_dir: str,
     model_paths: dict,
-    feature_names: list,
-    expanded: bool,
     gpu_active: bool,
     backend: str,
     horizon: int,
@@ -672,15 +647,12 @@ def save_ensemble_metadata(
                 "gpu_used": gpu_active,
                 "model_files": model_paths,
                 "model_names": list(model_paths.keys()),
-                "feature_names": feature_names,
-                "feature_count": len(feature_names),
                 "lookback": lookback,
-                "expanded_features": expanded,
-                "microstructure_features": "micro" in out_dir.lower() or any("vprof" in f for f in feature_names),
                 "label_horizon": horizon,
                 "long_threshold": long_thr,
                 "classification": "binary",
                 "class_names": LABEL_NAMES,
+                "model_configs": {r: MODEL_CONFIGS[r] for r in model_paths},
             },
             f,
             indent=2,
@@ -745,13 +717,13 @@ def main():
     logger.info(f"After indicators: {len(df):,} rows")
 
     logger.info("Building feature matrix...")
-    X = build_features(df, lookback=args.lookback, expanded=args.expanded_features, micro=args.microstructure_features)
-    feature_names = list(X.columns)
-    logger.info(f"Features: {len(feature_names)} | {feature_names[:15]}...")
+    X = build_features(df, lookback=args.lookback)
+    all_feature_names = get_all_feature_names()
+    logger.info(f"All available features ({len(all_feature_names)}): {all_feature_names}")
 
     if args.label_col:
         logger.info(f"Using existing labels from column: {args.label_col}")
-        y = df[args.label_col].iloc[args.lookback - 1:].reset_index(drop=True)
+        y = df[args.label_col].iloc[args.lookback:].reset_index(drop=True)
     else:
         logger.info("Building labels...")
         y = build_labels(df, lookback=args.lookback, horizon=args.horizon, long_threshold=args.long_threshold)
@@ -770,23 +742,16 @@ def main():
             y_enc = y.values.astype(int)
             full_weight = compute_sample_weights(y)
             params = get_lgbm_params(role, device_type)
-            n_neg_full = (y_enc == 0).sum()
-            n_pos_full = max((y_enc == 1).sum(), 1)
-            params["scale_pos_weight"] = n_neg_full / n_pos_full
             n_est = params.pop("n_estimators", 500)
-            full_data = lgb.Dataset(X.astype(np.float32).values, label=y_enc, weight=full_weight)
+            # Use only this role's features for full-dataset refit
+            role_feats = [f for f in MODEL_CONFIGS[role]["features"] if f in X.columns]
+            X_role = X[role_feats].astype(np.float32).values
+            full_data = lgb.Dataset(X_role, label=y_enc, weight=full_weight)
             model = lgb.train(params, full_data, num_boost_round=n_est)
             path = save_lgbm_model(
-                model,
-                feature_names,
-                summary,
-                role,
-                args.out_dir,
-                args.expanded_features,
-                args.horizon,
-                args.long_threshold,
-                device_type,
-                args.lookback,
+                model, role, args.out_dir, args.horizon,
+                args.long_threshold, device_type, args.lookback,
+                summary=summary,
             )
         else:
             pipeline, summary = walk_forward_sklearn(X, y, role, args.n_splits)
@@ -809,8 +774,6 @@ def main():
     save_ensemble_metadata(
         args.out_dir,
         model_paths,
-        feature_names,
-        args.expanded_features,
         gpu_active,
         backend,
         args.horizon,
