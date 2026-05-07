@@ -116,7 +116,8 @@ class LiveScalper:
     def __init__(self, model_path=None, config_path=None, device=None,
                  scalp_cfg: Optional[ScalperConfig] = None,
                  hot_cfg: Optional[HotWindowConfig] = None,
-                 use_hot_window: bool = True):
+                 use_hot_window: bool = True,
+                 direction: int = 1):
         self.settings = Settings
         self.interface = MT5Interface()
         self.risk_mgr = FTMORiskManager(self.interface)
@@ -129,7 +130,8 @@ class LiveScalper:
         if not self.interface.authorized:
             self.interface.initialize()
         self.symbol = self.interface.symbol
-        self.planner = ScalperPlanner(scalp_cfg or ScalperConfig())
+        self.direction = direction
+        self.planner = ScalperPlanner(scalp_cfg or ScalperConfig(), direction=direction)
         self.pos: Optional[ScalpOpen] = None
         self.bar_counter = 0
 
@@ -141,8 +143,9 @@ class LiveScalper:
         )
 
         cfg = self.planner.cfg
+        side_label = "LONG" if direction > 0 else "SHORT"
         logger.info(
-            f"LONG-ONLY Scalper ready symbol={self.symbol} "
+            f"{side_label}-ONLY Scalper ready symbol={self.symbol} "
             f"session={cfg.session_start_utc:02d}-{cfg.session_end_utc:02d}UTC "
             f"RR={cfg.rr_partial}/{cfg.rr_final} cooldown={cfg.cooldown_bars} "
             f"goal=+{cfg.daily_goal_R}R stop=-{cfg.daily_stop_R}R "
@@ -274,9 +277,14 @@ class LiveScalper:
                         continue
                     fill_price = decision.fill_price or ref_price
                     sl_dist = plan.sl_dist
-                    plan.sl  = fill_price - sl_dist
-                    plan.tp1 = fill_price + self.planner.cfg.rr_partial * sl_dist
-                    plan.tp2 = fill_price + self.planner.cfg.rr_final   * sl_dist
+                    if self.direction > 0:
+                        plan.sl  = fill_price - sl_dist
+                        plan.tp1 = fill_price + self.planner.cfg.rr_partial * sl_dist
+                        plan.tp2 = fill_price + self.planner.cfg.rr_final   * sl_dist
+                    else:
+                        plan.sl  = fill_price + sl_dist
+                        plan.tp1 = fill_price - self.planner.cfg.rr_partial * sl_dist
+                        plan.tp2 = fill_price - self.planner.cfg.rr_final   * sl_dist
                     plan.entry = fill_price
                     logger.info(
                         f"hot fill @ {fill_price:.2f} ({decision.reason}, {decision.elapsed_seconds:.1f}s)"
@@ -302,9 +310,14 @@ class LiveScalper:
                 real_entry = my_pos.price_open if my_pos else plan.entry
                 plan.entry = real_entry
                 sl_dist = plan.sl_dist
-                plan.sl  = real_entry - sl_dist
-                plan.tp1 = real_entry + self.planner.cfg.rr_partial * sl_dist
-                plan.tp2 = real_entry + self.planner.cfg.rr_final   * sl_dist
+                if self.direction > 0:
+                    plan.sl  = real_entry - sl_dist
+                    plan.tp1 = real_entry + self.planner.cfg.rr_partial * sl_dist
+                    plan.tp2 = real_entry + self.planner.cfg.rr_final   * sl_dist
+                else:
+                    plan.sl  = real_entry + sl_dist
+                    plan.tp1 = real_entry - self.planner.cfg.rr_partial * sl_dist
+                    plan.tp2 = real_entry - self.planner.cfg.rr_final   * sl_dist
 
                 if my_pos:
                     self.interface.modify_position(ok.order, plan.sl, plan.tp2)
@@ -330,7 +343,7 @@ class LiveScalper:
         if self.pos is None:
             p = positions[0]
             self.pos = ScalpOpen(
-                side=+1,
+                side=self.direction,
                 entry=float(p.price_open),
                 sl=float(p.sl), tp1=float(p.tp), tp2=float(p.tp),
                 entry_bar=self.bar_counter, entry_time=now_utc,
@@ -385,9 +398,11 @@ class LiveScalper:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="XAUUSD LONG-ONLY scalper")
+    ap = argparse.ArgumentParser(description="XAUUSD scalper (long or short)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--device", type=str, default=None)
+    ap.add_argument("--side", type=str, default="long", choices=["long", "short"],
+                    help="Trade direction")
     ap.add_argument("--min-prob", type=float, default=None)
     ap.add_argument("--rr-final", type=float, default=None)
     ap.add_argument("--rr-partial", type=float, default=None)
@@ -404,6 +419,8 @@ def main():
     ap.add_argument("--hot-abort", type=float, default=None)
     ap.add_argument("--hot-abort-atr", type=float, default=None)
     args = ap.parse_args()
+
+    direction = 1 if args.side == "long" else -1
 
     cfg = ScalperConfig(symbol=Settings.SYMBOL)
     if args.min_prob is not None:  cfg.min_prob_long = args.min_prob
@@ -425,7 +442,7 @@ def main():
 
     LiveScalper(
         device=args.device, scalp_cfg=cfg, hot_cfg=hot_cfg,
-        use_hot_window=not args.no_hot_window,
+        use_hot_window=not args.no_hot_window, direction=direction,
     ).run(dry_run=args.dry_run)
 
 

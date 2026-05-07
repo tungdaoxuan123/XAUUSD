@@ -37,15 +37,15 @@ class ExitConfig:
     kelly_cap:      float = 0.25         # never bet more than 25% Kelly fraction
 
     # SL
-    atr_mult_sl:    float = 2.0          # base chandelier multiple
+    atr_mult_sl:    float = 1.0          # base chandelier multiple (matches triple-barrier sl-atr)
     swing_lookback: int   = 20           # bars for recent swing low
     min_sl_pips:    float = 2.0          # safety floor (~$0.20 for XAU)
 
     # TP / Risk-Reward (fixed 2:1)
     rr_base:        float = 2.0          # fixed TP = 2 * SL
 
-    # Probability gate (long-only)
-    min_prob_long:  float = 0.55
+    # Probability gate
+    min_prob:       float = 0.55
 
     # Microstructure / spread gating
     max_spread_ratio: float = 1.5
@@ -100,8 +100,9 @@ class OpenPosition:
 # ---------------------------------------------------------------------------
 
 class ExitPlanner:
-    def __init__(self, config: Optional[ExitConfig] = None):
+    def __init__(self, config: Optional[ExitConfig] = None, direction: int = 1):
         self.cfg = config or ExitConfig()
+        self.direction = direction  # +1=long, -1=short
 
     @staticmethod
     def _kelly(p: float, rr: float) -> float:
@@ -118,8 +119,12 @@ class ExitPlanner:
         if lb <= 2:
             return max(cfg.atr_mult_sl * atr, cfg.min_sl_pips)
         recent = bar_df.iloc[-lb:]
-        swing_low = float(recent["low"].min())
-        d_swing = max(0.0, last_close - swing_low)
+        if self.direction > 0:
+            swing_low = float(recent["low"].min())
+            d_swing = max(0.0, last_close - swing_low)
+        else:
+            swing_high = float(recent["high"].max())
+            d_swing = max(0.0, swing_high - last_close)
         chand = cfg.atr_mult_sl * atr
         return max(chand, d_swing * 0.5, cfg.min_sl_pips)
 
@@ -139,13 +144,16 @@ class ExitPlanner:
                    bar_df, equity: float, spread_now: float) -> TradePlan:
         cfg = self.cfg
         plan = TradePlan(prob=prob)
+        d = self.direction
 
         if signal <= 0:
-            plan.skip = True; plan.reason = "no long signal"; return plan
-
-        if prob < cfg.min_prob_long:
             plan.skip = True
-            plan.reason = f"p_long {prob:.2f} < {cfg.min_prob_long}"
+            plan.reason = f"no {'long' if d>0 else 'short'} signal"
+            return plan
+
+        if prob < cfg.min_prob:
+            plan.skip = True
+            plan.reason = f"p {prob:.2f} < {cfg.min_prob}"
             return plan
 
         if "spread_mean" in bar_df.columns:
@@ -158,7 +166,7 @@ class ExitPlanner:
 
         if "signed_vol_z" in bar_df.columns:
             z = float(bar_df["signed_vol_z"].iloc[-1])
-            if abs(z) > cfg.news_signed_z_abs and z < 0:
+            if abs(z) > cfg.news_signed_z_abs and np.sign(z) != d:
                 plan.skip = True
                 plan.reason = f"contrarian vol z={z:.1f}"
                 return plan
@@ -172,12 +180,14 @@ class ExitPlanner:
         rr = cfg.rr_base
         tp_dist = rr * sl_dist
 
-        sl = entry - sl_dist
-        tp = entry + tp_dist
+        if d > 0:
+            sl = entry - sl_dist; tp = entry + tp_dist
+        else:
+            sl = entry + sl_dist; tp = entry - tp_dist
 
         lots = self._size(equity, sl_dist, prob, rr)
 
-        plan.side = 1
+        plan.side = d
         plan.entry = entry
         plan.sl = sl; plan.tp = tp
         plan.sl_dist = sl_dist; plan.rr = rr
@@ -197,7 +207,7 @@ class ExitPlanner:
         upd = ManageUpdate()
         last = float(bar_df["close"].iloc[-1])
 
-        pos.best_price = max(pos.best_price, last)
+        pos.best_price = max(pos.best_price, last) if pos.side > 0 else min(pos.best_price, last)
 
         if bar_idx - pos.entry_bar >= cfg.max_hold_bars:
             upd.close_reason = "time"

@@ -146,8 +146,9 @@ class DayStats:
 # ---------------------------------------------------------------------------
 
 class ScalperPlanner:
-    def __init__(self, cfg: Optional[ScalperConfig] = None):
+    def __init__(self, cfg: Optional[ScalperConfig] = None, direction: int = 1):
         self.cfg = cfg or ScalperConfig()
+        self.direction = direction
         self.day = DayStats(date_utc="")
 
     def _today_key(self, now_utc: datetime) -> str:
@@ -241,9 +242,15 @@ class ScalperPlanner:
 
         entry = float(bar_df["close"].iloc[-1])
         sl_dist = self._sl_distance(bar_df, atr)
-        sl  = entry - sl_dist
-        tp1 = entry + cfg.rr_partial * sl_dist
-        tp2 = entry + cfg.rr_final   * sl_dist
+        d = self.direction
+        if d > 0:
+            sl  = entry - sl_dist
+            tp1 = entry + cfg.rr_partial * sl_dist
+            tp2 = entry + cfg.rr_final   * sl_dist
+        else:
+            sl  = entry + sl_dist
+            tp1 = entry - cfg.rr_partial * sl_dist
+            tp2 = entry - cfg.rr_final   * sl_dist
 
         lots = self._size(equity, sl_dist)
         plan.side = signal
@@ -272,9 +279,13 @@ class ScalperPlanner:
         elif bar_idx - pos.entry_bar >= cfg.max_hold_bars * 6:
             upd.close_reason = "time"; return upd
 
-        pos.best_price = max(pos.best_price, last)
-        tp1_hit = last >= pos.tp1
-        tp2_hit = last >= pos.tp2
+        pos.best_price = max(pos.best_price, last) if pos.side > 0 else min(pos.best_price, last)
+        if pos.side > 0:
+            tp1_hit = last >= pos.tp1
+            tp2_hit = last >= pos.tp2
+        else:
+            tp1_hit = last <= pos.tp1
+            tp2_hit = last <= pos.tp2
 
         if tp2_hit:
             upd.close_reason = "tp2"; return upd
@@ -288,9 +299,14 @@ class ScalperPlanner:
 
         if pos.be_moved and atr > 0:
             trail_dist = cfg.trail_mult_atr * atr
-            new_sl = pos.best_price - trail_dist
-            if new_sl > pos.sl:
-                upd.new_sl = new_sl
+            if pos.side > 0:
+                new_sl = pos.best_price - trail_dist
+                if new_sl > pos.sl:
+                    upd.new_sl = new_sl
+            else:
+                new_sl = pos.best_price + trail_dist
+                if new_sl < pos.sl:
+                    upd.new_sl = new_sl
         return upd
 
     def record_close(self, pnl_R: float, close_bar: int, now_utc: datetime):

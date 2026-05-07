@@ -207,6 +207,39 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # This prevents dropping thousands of bars if microstructure data is partially missing.
     indicator_cols = ["RSI", "MACD", "Signal_Line", "ATR", "BB_width", "VWAP"]
     df = df.dropna(subset=[c for c in indicator_cols if c in df.columns]).reset_index(drop=True)
+
+    # ---- Regime / session features (Problem 2) ----
+    # ATR ratio: short-term vs long-term volatility
+    atr_100 = pd.concat([df["high"] - df["low"],
+                         (df["high"] - df["close"].shift()).abs(),
+                         (df["low"] - df["close"].shift()).abs()], axis=1).max(axis=1).rolling(100).mean()
+    df["atr_ratio"] = (df["ATR"] / (atr_100 + 1e-9)).clip(0, 10)
+
+    # ADX
+    tr = pd.concat([df["high"] - df["low"],
+                    (df["high"] - df["close"].shift()).abs(),
+                    (df["low"] - df["close"].shift()).abs()], axis=1).max(axis=1)
+    plus_dm = (df["high"] - df["high"].shift()).clip(lower=0)
+    minus_dm = (df["low"].shift() - df["low"]).clip(lower=0)
+    atr_14 = tr.rolling(14).mean()
+    plus_di = 100 * (plus_dm.rolling(14).mean() / (atr_14 + 1e-9))
+    minus_di = 100 * (minus_dm.rolling(14).mean() / (atr_14 + 1e-9))
+    dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9))
+    df["adx_14"] = dx.rolling(14).mean().fillna(0)
+
+    # Session / time features
+    if "time" in df.columns:
+        dt_idx = pd.to_datetime(df["time"])
+        hour = dt_idx.dt.hour
+    else:
+        hour = pd.Series(0, index=df.index)
+    df["is_london"]  = ((hour >= 7)  & (hour < 16)).astype(int)
+    df["is_ny"]      = ((hour >= 13) & (hour < 21)).astype(int)
+    df["is_overlap"] = ((hour >= 13) & (hour < 16)).astype(int)
+    df["hour_sin"]   = np.sin(2 * np.pi * hour / 24)
+    df["hour_cos"]   = np.cos(2 * np.pi * hour / 24)
+    df["dow"]        = pd.to_datetime(df["time"]).dt.dayofweek if "time" in df.columns else 0
+
     return df
 
 
@@ -220,6 +253,8 @@ def get_feature_names(lookback: int, expanded: bool = False, micro: bool = False
     common = base + ["RSI", "MACD", "Signal_Line", "current_position", "current_balance"]
     if expanded:
         common += ["MACD_Hist", "VWAP", "close_minus_vwap", "ATR", "BB_width"]
+        common += ["atr_ratio", "adx_14", "is_london", "is_ny", "is_overlap",
+                   "hour_sin", "hour_cos", "dow"]
     if micro:
         common += [
             "tick_imbalance", "bid_ask_vol_imbalance", "spread_mean", "ofi_window", "of_pressure_flag",
@@ -236,11 +271,19 @@ def build_features(df: pd.DataFrame, lookback: int = 10, expanded: bool = False,
         "vprof_poc_dist", "vprof_in_value_area", "vprof_hvn_flag", "vprof_lvn_flag"
     ]
     
-    # Fill NAs for micro features with neutral values (0) so we can still use the full dataset
+    # Fill NAs for micro features with median + clip (Problem 1)
+    MICRO_COLS = ["tick_imbalance", "ofi_window", "cs_spread", "kyle_lambda",
+                  "vprof_poc_dist", "spread_mean", "bid_ask_vol_imbalance",
+                  "of_pressure_flag", "vprof_in_value_area", "vprof_hvn_flag", "vprof_lvn_flag"]
     if micro:
         for col in micro_cols:
             if col in df.columns:
-                df[col] = df[col].fillna(0)
+                df[col] = df[col].fillna(df[col].median() if df[col].notna().sum() > 0 else 0)
+                if df[col].notna().sum() > 10:
+                    lo = df[col].quantile(0.01)
+                    hi = df[col].quantile(0.99)
+                    if lo < hi:
+                        df[col] = df[col].clip(lo, hi)
             else:
                 logger.warning(f"Micro feature column {col} missing from data!")
                 df[col] = 0.0
@@ -268,6 +311,14 @@ def build_features(df: pd.DataFrame, lookback: int = 10, expanded: bool = False,
                 float(latest["close_minus_vwap"]),
                 float(latest["ATR"]),
                 float(latest["BB_width"]),
+                float(latest.get("atr_ratio", 0)),
+                float(latest.get("adx_14", 0)),
+                int(latest.get("is_london", 0)),
+                int(latest.get("is_ny", 0)),
+                int(latest.get("is_overlap", 0)),
+                float(latest.get("hour_sin", 0)),
+                float(latest.get("hour_cos", 0)),
+                int(latest.get("dow", 0)),
             ]
             
         if micro:
@@ -324,35 +375,32 @@ def get_lgbm_params(role: str, device_type: str) -> dict:
         "device_type": device_type,
         "verbose": -1,
         "random_state": 42,
+        "max_bin": 63,           # CRITICAL for AMD OpenCL
+        "min_child_samples": 100,
+        "reg_alpha": 0.1,
+        "reg_lambda": 1.0,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 5,
     }
 
     if role == "trend":
         return {**base,
             "n_estimators": 500,
-            "num_leaves": 31,
+            "num_leaves": 63,
             "learning_rate": 0.05,
-            "min_child_samples": 20,
-            "reg_alpha": 0.1,
-            "reg_lambda": 0.1,
         }
     elif role == "structure":
         return {**base,
             "n_estimators": 500,
             "num_leaves": 63,
             "learning_rate": 0.03,
-            "min_child_samples": 15,
-            "feature_fraction": 0.8,
-            "bagging_fraction": 0.8,
-            "bagging_freq": 5,
         }
     elif role == "regime":
         return {**base,
-            "n_estimators": 700,
-            "num_leaves": 31,
+            "n_estimators": 500,
+            "num_leaves": 63,
             "learning_rate": 0.02,
-            "min_child_samples": 30,
-            "reg_alpha": 0.2,
-            "feature_fraction": 0.7,
         }
     return base
 
@@ -412,6 +460,11 @@ def walk_forward_lgbm(
 
         params = get_lgbm_params(role, device_type)
         n_est = params.pop("n_estimators", 500)
+
+        # Per-fold scale_pos_weight (Problem 5)
+        n_neg = (y_train_enc == 0).sum()
+        n_pos = max((y_train_enc == 1).sum(), 1)
+        params["scale_pos_weight"] = n_neg / n_pos
 
         train_data = lgb.Dataset(X_train, label=y_train_enc, weight=sample_weight)
         val_data = lgb.Dataset(X_val, label=y_val_enc, reference=train_data)
@@ -717,6 +770,9 @@ def main():
             y_enc = y.values.astype(int)
             full_weight = compute_sample_weights(y)
             params = get_lgbm_params(role, device_type)
+            n_neg_full = (y_enc == 0).sum()
+            n_pos_full = max((y_enc == 1).sum(), 1)
+            params["scale_pos_weight"] = n_neg_full / n_pos_full
             n_est = params.pop("n_estimators", 500)
             full_data = lgb.Dataset(X.astype(np.float32).values, label=y_enc, weight=full_weight)
             model = lgb.train(params, full_data, num_boost_round=n_est)

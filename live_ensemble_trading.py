@@ -26,12 +26,13 @@ logger = setup_logging()
 
 
 class LiveEnsembleTrader:
-    """Long-only live trading bot with binary ensemble + fixed 2:1 TP/SL."""
+    """Binary ensemble trading bot with fixed 2:1 TP/SL. Supports long or short."""
 
-    def __init__(self, ensemble_path=None):
+    def __init__(self, ensemble_path=None, direction: int = 1):
         self.settings = Settings
         self.interface = MT5Interface()
         self.risk_mgr = FTMORiskManager(self.interface)
+        self.direction = direction  # +1=long, -1=short
 
         model_path = ensemble_path or self.settings.ENSEMBLE_MODEL_PATH
         self.ensemble = EnsembleGPU.load(model_path)
@@ -44,8 +45,9 @@ class LiveEnsembleTrader:
             self.interface.initialize()
             self.current_symbol = self.interface.symbol
 
+        side_label = "LONG" if direction > 0 else "SHORT"
         logger.info(
-            f"LONG-ONLY Ensemble Bot ready — Symbol: {self.current_symbol} | "
+            f"{side_label}-ONLY Ensemble Bot ready — Symbol: {self.current_symbol} | "
             f"Model: {model_path} | Micro: {self.ensemble.micro}"
         )
 
@@ -136,6 +138,14 @@ class LiveEnsembleTrader:
             float(feat_latest["close_minus_vwap"]),
             float(feat_latest["ATR"]),
             float(feat_latest["BB_width"]),
+            float(feat_latest.get("atr_ratio", 0)),
+            float(feat_latest.get("adx_14", 0)),
+            int(feat_latest.get("is_london", 0)),
+            int(feat_latest.get("is_ny", 0)),
+            int(feat_latest.get("is_overlap", 0)),
+            float(feat_latest.get("hour_sin", 0)),
+            float(feat_latest.get("hour_cos", 0)),
+            int(feat_latest.get("dow", 0)),
         ]
 
         if self.ensemble.micro:
@@ -207,18 +217,21 @@ class LiveEnsembleTrader:
                             latest['close'] > latest['VWAP']
                         )
 
-                        is_long_signal = (
+                        is_directional_signal = (
                             long_action == 1.0 and
                             bull_confirm and
                             long_confidence >= self.long_confidence
                         )
 
-                        if is_long_signal:
-                            # Fixed 2:1 ATR-derived TP/SL
-                            sl_dist = atr * 2.0
+                        if is_directional_signal:
+                            sl_dist = atr * 1.0
                             tp_dist = 2.0 * sl_dist
-                            sl = current_price - sl_dist
-                            tp = current_price + tp_dist
+                            if self.direction > 0:
+                                sl = current_price - sl_dist
+                                tp = current_price + tp_dist
+                            else:
+                                sl = current_price + sl_dist
+                                tp = current_price - tp_dist
 
                             lots = self.risk_mgr.calculate_position_size(
                                 float(long_confidence), sl_dist
@@ -232,7 +245,7 @@ class LiveEnsembleTrader:
                                         f"Conf: {long_confidence:.3f}"
                                     )
                                 else:
-                                    self.interface.send_order(1.0, lots, sl, tp)
+                                    self.interface.send_order(float(self.direction), lots, sl, tp)
                                     time.sleep(2)
 
                         last_update = now
@@ -261,13 +274,16 @@ def main():
     parser.add_argument("--interval", type=int, default=10)
     parser.add_argument("--long-thresh", type=float)
     parser.add_argument("--long-conf", type=float)
+    parser.add_argument("--side", type=str, default="long", choices=["long", "short"],
+                        help="Trade direction")
     args = parser.parse_args()
 
     if args.symbol:
         Settings.SYMBOL = args.symbol
 
     model_path = args.model or Settings.ENSEMBLE_MODEL_PATH
-    trader = LiveEnsembleTrader(ensemble_path=model_path)
+    direction = 1 if args.side == "long" else -1
+    trader = LiveEnsembleTrader(ensemble_path=model_path, direction=direction)
     if args.long_thresh is not None:
         trader.long_threshold = args.long_thresh
     if args.long_conf is not None:

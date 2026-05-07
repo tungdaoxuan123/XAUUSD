@@ -33,8 +33,14 @@ as synthetic spread widening so the math is internally consistent.
 
 Cost constants
 --------------
+<<<<<<< HEAD
   COMMISSION_PIPS = 0.00006   FTMO raw account: $6/lot round-trip
   DEFAULT_SPREAD  = 0.00008   0.8 pip fallback
+=======
+  COMMISSION_PIPS = args.commission   FTMO raw account: $6/lot round-trip on GBPUSD
+                               ($3/lot/side * 2 sides = $6 = 0.6 pips)
+  DEFAULT_SPREAD  = 0.00008   0.8 pip fallback when cs_spread column absent
+>>>>>>> 722a9a899a0e51657b071f342974d45d54fbb6b2
 
 Spread column resolution order
 -------------------------------
@@ -92,6 +98,7 @@ logger = logging.getLogger("TripleBarrier")
 
 # FTMO Raw account: $3/lot/side commission on GBPUSD
 # $10/pip/lot => $6 round-trip = 0.6 pips = 0.00006 in price terms
+# NOTE: overwritten in main() via --commission CLI arg
 COMMISSION_PIPS: float = 0.00006
 
 # Fallback spread when the cs_spread / spread_mean / spread_est column is
@@ -129,25 +136,31 @@ def triple_barrier_labels(
     sl_atr: float = 1.0,
     max_hold: int = 30,
     side_col: str | None = None,
+    direction: int = 1,
 ) -> pd.DataFrame:
-    """Compute LONG-ONLY triple-barrier outcomes for each bar.
+    """Compute triple-barrier outcomes for each bar (long or short).
+
+    Parameters
+    ----------
+    direction : int
+        +1 = evaluate long entries (TP above, SL below)
+        -1 = evaluate short entries (TP below, SL above)
 
     Barriers (cost-adjusted)
     ------------------------
-    entry_ask = close[i] + half_spread
-    upper     = entry_ask + pt_atr * ATR[i]   (TP)
-    lower     = entry_ask - sl_atr * ATR[i]   (SL)
+    Long (direction=+1):
+        entry_ask = close[i] + half_spread
+        upper     = entry_ask + pt_atr * ATR[i]   (TP)
+        lower     = entry_ask - sl_atr * ATR[i]   (SL)
 
-    TP hit when  high[j] - half_spread >= upper
-    SL hit when  low[j]  - half_spread <= lower
+    Short (direction=-1):
+        entry_bid = close[i] - half_spread
+        upper     = entry_bid - pt_atr * ATR[i]   (TP: price moves down)
+        lower     = entry_bid + sl_atr * ATR[i]   (SL: price moves up)
 
     Outcome mapping (binary):
-        1  = valid long trade (TP hit first)
+        1  = valid trade (TP hit first)
         0  = wait / do nothing (SL hit or timeout)
-
-    All entries are evaluated as long candidates only. Short-side
-    evaluation has been removed. If `side_col` is provided, only +1
-    entries are evaluated.
     """
     required = {"close", "high", "low", "ATR"}
     missing = required - set(df.columns)
@@ -162,11 +175,12 @@ def triple_barrier_labels(
 
     spread_arr = _resolve_spread_series(df).values.astype("float64")
 
-    side = (
-        df[side_col].values.astype("int8")
-        if side_col
-        else np.ones(n, dtype="int8")
-    )
+    if side_col:
+        raw_side = df[side_col].values.astype("int8")
+        # Only evaluate entries matching our direction
+        side = np.where(raw_side == direction, direction, 0).astype("int8")
+    else:
+        side = np.full(n, direction, dtype="int8")
 
     tb_label = np.zeros(n, dtype="int8")
     tb_ret   = np.zeros(n, dtype="float32")
@@ -174,7 +188,7 @@ def triple_barrier_labels(
 
     for i in range(n):
         s = side[i]
-        if s <= 0:
+        if s == 0:
             continue
         atr_i = atr[i]
         if np.isnan(atr_i) or atr_i <= 0:
@@ -183,9 +197,14 @@ def triple_barrier_labels(
         effective_spread = spread_arr[i] + COMMISSION_PIPS
         half_spread      = effective_spread / 2.0
 
-        entry    = close[i] + half_spread
-        upper    = entry + pt_atr * atr_i
-        lower    = entry - sl_atr * atr_i
+        if s > 0:
+            entry    = close[i] + half_spread
+            upper    = entry + pt_atr * atr_i
+            lower    = entry - sl_atr * atr_i
+        else:
+            entry    = close[i] - half_spread
+            upper    = entry - pt_atr * atr_i
+            lower    = entry + sl_atr * atr_i
 
         end     = min(i + 1 + max_hold, n)
         hit     = -1
@@ -194,24 +213,28 @@ def triple_barrier_labels(
         for j in range(i + 1, end):
             hi_j, lo_j = high[j], low[j]
 
-            high_bid = hi_j - half_spread
-            low_bid  = lo_j - half_spread
-            if high_bid >= upper:
-                outcome = 1
-                hit = j
-                break
-            if low_bid <= lower:
-                outcome = 0
-                hit = j
-                break
+            if s > 0:
+                high_bid = hi_j - half_spread
+                low_bid  = lo_j - half_spread
+                if high_bid >= upper:
+                    outcome = 1; hit = j; break
+                if low_bid <= lower:
+                    outcome = 0; hit = j; break
+            else:
+                high_ask = hi_j + half_spread
+                low_ask  = lo_j + half_spread
+                if low_ask <= upper:
+                    outcome = 1; hit = j; break
+                if high_ask >= lower:
+                    outcome = 0; hit = j; break
 
         if hit == -1:
             j       = end - 1
-            ret     = (close[j] - entry) / entry
+            ret     = (close[j] - entry) / entry * (1 if s > 0 else -1)
             outcome = 0
             hit     = j
         else:
-            ret = (close[hit] - entry) / entry
+            ret = (close[hit] - entry) / entry * (1 if s > 0 else -1)
 
         tb_label[i] = outcome
         tb_ret[i]   = ret
@@ -234,15 +257,13 @@ def meta_labels_from_primary(
     pt_atr: float = 2.0,
     sl_atr: float = 1.0,
     max_hold: int = 30,
+    direction: int = 1,
 ) -> pd.DataFrame:
-    """Compute long-only triple-barrier outcomes along the primary model's side.
-
-    meta_label = 1 if long trade hit TP, else 0 (SL or timeout)
-    This becomes the target for a binary "should we act" filter model.
-    """
+    """Compute triple-barrier outcomes along the primary model's side."""
     if primary_col not in df.columns:
         raise ValueError(f"Primary column '{primary_col}' not found")
-    out = triple_barrier_labels(df, pt_atr, sl_atr, max_hold, side_col=primary_col)
+    out = triple_barrier_labels(df, pt_atr, sl_atr, max_hold,
+                                side_col=primary_col, direction=direction)
     out["meta_label"]  = (out["tb_label"] == 1).astype("int8")
     out["has_signal"]  = (out[primary_col] > 0).astype("int8")
     return out
@@ -296,7 +317,17 @@ def main():
                    help="Run meta-labeling (requires --preds column 'primary_pred')")
     p.add_argument("--preds",    default=None,
                    help="CSV with primary_pred column aligned to data")
+    p.add_argument("--commission", type=float, default=0.00006,
+                   help="Commission in price terms. Use 0.00003 for JPY pairs.")
+    p.add_argument("--side", type=str, default="long", choices=["long", "short"],
+                   help="Direction: long (PT above, SL below) or short (PT below, SL above)")
     args = p.parse_args()
+
+    direction = 1 if args.side == "long" else -1
+
+    # Wire CLI commission arg to the module-level constant used in the labeler
+    global COMMISSION_PIPS
+    COMMISSION_PIPS = args.commission
 
     df = pd.read_csv(args.data)
     df.columns = [c.lower().strip() for c in df.columns]
@@ -315,13 +346,16 @@ def main():
         preds              = pd.read_csv(args.preds)
         df["primary_pred"] = preds["primary_pred"].astype("int8")
         out = meta_labels_from_primary(
-            df, pt_atr=args.pt_atr, sl_atr=args.sl_atr, max_hold=args.max_hold
+            df, pt_atr=args.pt_atr, sl_atr=args.sl_atr, max_hold=args.max_hold,
+            direction=direction,
         )
     else:
         out = triple_barrier_labels(
-            df, pt_atr=args.pt_atr, sl_atr=args.sl_atr, max_hold=args.max_hold
+            df, pt_atr=args.pt_atr, sl_atr=args.sl_atr, max_hold=args.max_hold,
+            direction=direction,
         )
 
+    side_label = args.side.upper()
     # Uniqueness & time-decay weights for downstream trainer
     w_u              = compute_uniqueness_weights(out["tb_hit_idx"].values, len(out))
     w_t              = time_decay_weights(len(out))
@@ -330,7 +364,7 @@ def main():
     out_path = args.out or args.data.replace(".csv", "_tb.csv")
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(out_path, index=False)
-    logger.info(f"Saved {len(out):,} rows with long-only triple-barrier labels -> {out_path}")
+    logger.info(f"Saved {len(out):,} rows with {side_label}-only triple-barrier labels -> {out_path}")
     if "tb_label" in out.columns:
         vc = out["tb_label"].value_counts().to_dict()
         n_one = vc.get(1, 0)

@@ -159,7 +159,7 @@ class SOTASignalGenerator:
 
 class LiveSOTATrader:
     def __init__(self, model_path=None, config_path=None, device=None,
-                 exit_config: Optional[ExitConfig] = None):
+                 exit_config: Optional[ExitConfig] = None, direction: int = 1):
         self.settings = Settings
         self.interface = MT5Interface()
         self.risk_mgr = FTMORiskManager(self.interface)
@@ -172,10 +172,11 @@ class LiveSOTATrader:
         if not self.interface.authorized:
             self.interface.initialize()
         self.current_symbol = self.interface.symbol
+        self.direction = direction
 
         if "GBP" in self.current_symbol:
             base_cfg = ExitConfig(
-                atr_mult_sl=2.5,
+                atr_mult_sl=1.0,
                 min_sl_pips=0.00050,
                 contract_size=100000.0,
                 max_hold_bars=45,
@@ -187,18 +188,18 @@ class LiveSOTATrader:
             )
 
         if exit_config:
-            base_cfg.min_prob_long = exit_config.min_prob_long
+            base_cfg.min_prob = exit_config.min_prob
 
-        self.planner = ExitPlanner(base_cfg)
+        self.planner = ExitPlanner(base_cfg, direction=direction)
 
         self._trackers: Dict[int, OpenPosition] = {}
         self._bar_counter = 0
         self._last_order_bar = -1
-
+        side_label = "LONG" if direction > 0 else "SHORT"
         logger.info(
-            f"LONG-ONLY SOTA Trader ready — symbol={self.current_symbol} "
+            f"{side_label}-ONLY SOTA Trader ready — symbol={self.current_symbol} "
             f"T={self.sota.temperature:.3f} "
-            f"min_p_long={self.planner.cfg.min_prob_long:.2f}"
+            f"min_p={self.planner.cfg.min_prob:.2f}"
         )
 
     # ---- helpers ----------------------------------------------------------
@@ -221,7 +222,8 @@ class LiveSOTATrader:
     # ---- main loop --------------------------------------------------------
 
     def run_live_trading(self, interval_seconds: int = 10, dry_run: bool = False):
-        logger.info(f"LONG-ONLY SOTA live loop ({interval_seconds}s, dry_run={dry_run})")
+        side_label = "LONG" if self.direction > 0 else "SHORT"
+        logger.info(f"{side_label}-ONLY SOTA live loop ({interval_seconds}s, dry_run={dry_run})")
         if not self.interface.initialize():
             logger.error("MT5 init failed"); return
         self.risk_mgr.initialize_balance()
@@ -254,8 +256,9 @@ class LiveSOTATrader:
 
                 signal, p_long, p_wait, entropy = self.sota.predict(df)
 
+                side_label = "LONG" if self.direction > 0 else "SHORT"
                 logger.info(
-                    f"scan signal={'LONG' if signal>0 else 'WAIT'} "
+                    f"scan signal={side_label if signal>0 else 'WAIT'} "
                     f"p_long={p_long:.3f} p_wait={p_wait:.3f} H={entropy:.3f}"
                 )
 
@@ -320,7 +323,7 @@ class LiveSOTATrader:
             tracker = self._trackers.get(tid)
             if tracker is None:
                 tracker = OpenPosition(
-                    side=+1,
+                    side=self.direction,
                     entry=float(p.price_open),
                     sl=float(p.sl),
                     tp=float(p.tp),
@@ -351,12 +354,14 @@ class LiveSOTATrader:
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(description="LONG-ONLY Live SOTA trading")
+    ap = argparse.ArgumentParser(description="Live SOTA trading (long or short)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--device", type=str)
     ap.add_argument("--symbol", type=str)
     ap.add_argument("--min-prob", type=float, default=None,
-                    help="Override min long probability threshold")
+                    help="Override min probability threshold")
+    ap.add_argument("--side", type=str, default="long", choices=["long", "short"],
+                    help="Trade direction")
     args = ap.parse_args()
 
     if args.symbol:
@@ -364,9 +369,10 @@ def main():
 
     exit_cfg = ExitConfig()
     if args.min_prob is not None:
-        exit_cfg.min_prob_long = args.min_prob
+        exit_cfg.min_prob = args.min_prob
 
-    trader = LiveSOTATrader(device=args.device, exit_config=exit_cfg)
+    direction = 1 if args.side == "long" else -1
+    trader = LiveSOTATrader(device=args.device, exit_config=exit_cfg, direction=direction)
     trader.run_live_trading(dry_run=args.dry_run)
 
 

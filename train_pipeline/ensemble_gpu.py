@@ -36,6 +36,8 @@ def get_feature_names(lookback: int, expanded: bool = False, micro: bool = False
     common = base + ["RSI", "MACD", "Signal_Line", "current_position", "current_balance"]
     if expanded:
         common += ["MACD_Hist", "VWAP", "close_minus_vwap", "ATR", "BB_width"]
+        common += ["atr_ratio", "adx_14", "is_london", "is_ny", "is_overlap",
+                   "hour_sin", "hour_cos", "dow"]
     if micro:
         common += [
             "tick_imbalance", "bid_ask_vol_imbalance", "spread_mean", "ofi_window", "of_pressure_flag",
@@ -86,9 +88,38 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["close_minus_vwap"] = close - df["VWAP"]
 
     df = df.replace([np.inf, -np.inf], np.nan)
-    # Only drop rows where the indicators we just computed are NaN
     indicator_cols = ["RSI", "MACD", "Signal_Line", "ATR", "BB_width", "VWAP"]
     df = df.dropna(subset=[c for c in indicator_cols if c in df.columns]).reset_index(drop=True)
+
+    # Regime / session features
+    atr_100 = pd.concat([df["high"] - df["low"],
+                         (df["high"] - df["close"].shift()).abs(),
+                         (df["low"] - df["close"].shift()).abs()], axis=1).max(axis=1).rolling(100).mean()
+    df["atr_ratio"] = (df["ATR"] / (atr_100 + 1e-9)).clip(0, 10)
+
+    tr = pd.concat([df["high"] - df["low"],
+                    (df["high"] - df["close"].shift()).abs(),
+                    (df["low"] - df["close"].shift()).abs()], axis=1).max(axis=1)
+    plus_dm = (df["high"] - df["high"].shift()).clip(lower=0)
+    minus_dm = (df["low"].shift() - df["low"]).clip(lower=0)
+    atr_14 = tr.rolling(14).mean()
+    plus_di = 100 * (plus_dm.rolling(14).mean() / (atr_14 + 1e-9))
+    minus_di = 100 * (minus_dm.rolling(14).mean() / (atr_14 + 1e-9))
+    dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9))
+    df["adx_14"] = dx.rolling(14).mean().fillna(0)
+
+    if "time" in df.columns:
+        dt_idx = pd.to_datetime(df["time"])
+        hour = dt_idx.dt.hour
+    else:
+        hour = pd.Series(0, index=df.index)
+    df["is_london"]  = ((hour >= 7)  & (hour < 16)).astype(int)
+    df["is_ny"]      = ((hour >= 13) & (hour < 21)).astype(int)
+    df["is_overlap"] = ((hour >= 13) & (hour < 16)).astype(int)
+    df["hour_sin"]   = np.sin(2 * np.pi * hour / 24)
+    df["hour_cos"]   = np.cos(2 * np.pi * hour / 24)
+    df["dow"]        = pd.to_datetime(df["time"]).dt.dayofweek if "time" in df.columns else 0
+
     return df
 
 
@@ -121,6 +152,14 @@ def build_obs_from_rates(rates, lookback: int = 10, expanded: bool = False, micr
             float(latest["close_minus_vwap"]), 
             float(latest["ATR"]), 
             float(latest["BB_width"]),
+            float(latest.get("atr_ratio", 0)),
+            float(latest.get("adx_14", 0)),
+            int(latest.get("is_london", 0)),
+            int(latest.get("is_ny", 0)),
+            int(latest.get("is_overlap", 0)),
+            float(latest.get("hour_sin", 0)),
+            float(latest.get("hour_cos", 0)),
+            int(latest.get("dow", 0)),
         ]
         
     if micro:

@@ -1,137 +1,102 @@
-﻿# LONG-ONLY XAUUSD/GBPUSD Trading System — Run Guide
+﻿# XAUUSD Dual-Direction Training Guide — AMD RX 6700 XT
 
-## Architecture
+Train **two independent binary models** — one for long entries, one for short entries.
+Both use fixed 2:1 TP/SL ratio with ATR-derived dynamic pip distances.
 
-4-layer stack, all long-only, fixed 2:1 TP/SL ratio with ATR-derived dynamic pip distances.
+---
 
-```
-RAW DATA  ->  SYNTHETIC MICRO  ->  TRIPLE-BARRIER LABELS  ->  MODEL TRAINING  ->  LIVE EXECUTION
-(MT5/Dukas)   (OFI/spread/VPOC)    (binary 0=wait 1=long)     (LGBM or PatchTST)   (fixed 2:1 TP/SL)
+## Data Source
+
+**Use Dukascopy** (522k+ bars) — MT5 is capped at ~100k.
+
+```powershell
+# Already downloaded: train_pipeline/data/xauusd_m1_1y_dukas.csv
+# 522,720 rows, Apr 2025 – Apr 2026
+
+# To fetch more (requires internet):
+python train_pipeline/fetch_data_dukascopy.py --symbol XAUUSD --from 2015-01-01 --to 2026-04-10 --out train_pipeline/data/xauusd_m1_dukas.csv
 ```
 
 ---
 
-## Prerequisites
+## Full Training Commands (LightGBM GPU)
 
-```
-pip install -r requirements.txt
-```
+```powershell
+$DATA = "train_pipeline/data/xauusd_m1_1y_dukas.csv"
 
-Create `.env`:
-```
-MT5_LOGIN=12345678
-MT5_PASSWORD=your_password
-MT5_SERVER=FTMO-Demo
-SYMBOL=XAUUSD.sim
-ENSEMBLE_MODEL_PATH=train_pipeline/models_gpu
+# STEP 1: Synthetic microstructure features
+python train_pipeline/synthetic_microstructure.py --m1 $DATA --out train_pipeline/data/xauusd_m1_synmicro.csv --vp-window 240 --bin-size 0.10 --ofi-window 20
+
+# STEP 2: Binary labels — LONG (0=wait, 1=enter long)
+python train_pipeline/triple_barrier_labels.py --data train_pipeline/data/xauusd_m1_synmicro.csv --out train_pipeline/data/xauusd_m1_tb_long.csv --side long --pt-atr 2.0 --sl-atr 1.0 --max-hold 30
+
+# STEP 3: Binary labels — SHORT (0=wait, 1=enter short)
+python train_pipeline/triple_barrier_labels.py --data train_pipeline/data/xauusd_m1_synmicro.csv --out train_pipeline/data/xauusd_m1_tb_short.csv --side short --pt-atr 2.0 --sl-atr 1.0 --max-hold 30
+
+# STEP 4: Train LONG model
+python train_pipeline/train_ensemble_gpu.py --data train_pipeline/data/xauusd_m1_tb_long.csv --label-col tb_label --expanded-features --microstructure-features --use-gpu --gpu-backend auto --out-dir train_pipeline/models_gpu_long
+
+# STEP 5: Train SHORT model
+python train_pipeline/train_ensemble_gpu.py --data train_pipeline/data/xauusd_m1_tb_short.csv --label-col tb_label --expanded-features --microstructure-features --use-gpu --gpu-backend auto --out-dir train_pipeline/models_gpu_short
 ```
 
 ---
 
-## PATH A — LightGBM Ensemble (fast, GPU via OpenCL, AMD RX 6700 XT)
+## Full Training Commands (PatchTST SOTA)
 
-### Step 1: Fetch data
 ```powershell
-python train_pipeline/fetch_data_mt5.py --symbol XAUUSD --timeframe M1 --bars 500000 --out train_pipeline/data/xauusd_m1.csv
-```
+# Steps 1-3 same as above, then:
 
-### Step 2: Synthetic microstructure features
-```powershell
-python train_pipeline/synthetic_microstructure.py --m1 train_pipeline/data/xauusd_m1.csv --out train_pipeline/data/xauusd_m1_synmicro.csv --vp-window 240 --bin-size 0.10 --ofi-window 20
-```
+# Train PatchTST LONG
+python train_pipeline/sota_signal_generator.py --data train_pipeline/data/xauusd_m1_tb_long.csv --out-dir train_pipeline/models_sota_long --seq-len 120 --patch-len 12 --epochs 20 --gpu
 
-### Step 3: Triple-barrier labels (long-only, 2:1 RR)
-```powershell
-python train_pipeline/triple_barrier_labels.py --data train_pipeline/data/xauusd_m1_synmicro.csv --out train_pipeline/data/xauusd_m1_tb.csv --pt-atr 2.0 --sl-atr 1.0 --max-hold 30
-```
-
-### Step 4: Train binary ensemble
-```powershell
-python train_pipeline/train_ensemble_gpu.py --data train_pipeline/data/xauusd_m1_tb.csv --label-col tb_label --expanded-features --microstructure-features --use-gpu --gpu-backend auto --out-dir train_pipeline/models_gpu
-```
-
-### Step 5: Live trading
-```powershell
-python live_ensemble_trading.py --dry-run
-python live_ensemble_trading.py                    # real orders
+# Train PatchTST SHORT
+python train_pipeline/sota_signal_generator.py --data train_pipeline/data/xauusd_m1_tb_short.csv --out-dir train_pipeline/models_sota_short --seq-len 120 --patch-len 12 --epochs 20 --gpu
 ```
 
 ---
 
-## PATH B — PatchTST SOTA (transformer, higher ceiling)
+## Running Both Bots Simultaneously
 
-### One-shot pipeline (XAUUSD):
 ```powershell
-python train_pipeline/synthetic_microstructure.py --m1 train_pipeline/data/xauusd_m1.csv --out train_pipeline/data/xauusd_m1_synmicro.csv --vp-window 240 --bin-size 0.10 --ofi-window 20
+# Terminal 1 — LONG bot
+python live_ensemble_trading.py --model train_pipeline/models_gpu_long --side long --dry-run
 
-python train_pipeline/triple_barrier_labels.py --data train_pipeline/data/xauusd_m1_synmicro.csv --out train_pipeline/data/xauusd_m1_synmicro_tb.csv --pt-atr 2.0 --sl-atr 1.0 --max-hold 30
-
-python train_pipeline/sota_signal_generator.py --data train_pipeline/data/xauusd_m1_synmicro_tb.csv --out-dir train_pipeline/models_sota --seq-len 120 --patch-len 12 --epochs 20 --gpu
+# Terminal 2 — SHORT bot
+python live_ensemble_trading.py --model train_pipeline/models_gpu_short --side short --dry-run
 ```
 
-Or use the shell script:
-```bash
-bash train_pipeline/run_sota_pipeline.sh
-```
+Remove `--dry-run` when ready for real orders.
 
-### One-shot pipeline (GBPUSD):
-```bash
-bash train_pipeline/run_gbpusd_pipeline.sh
-```
+---
+
+## Running with SOTA models
+
 ```powershell
-.\train_pipeline\run_gbpusd_pipeline.ps1
-```
-
-### Live SOTA trading:
-```powershell
-python live_sota_trading.py --dry-run --min-prob 0.55
-python live_sota_trading.py --min-prob 0.55          # real orders
+python live_sota_trading.py --model train_pipeline/models_sota_long/patchtst_primary.pt --config train_pipeline/models_sota_long/sota_config.json --side long --dry-run
+python live_sota_trading.py --model train_pipeline/models_sota_short/patchtst_primary.pt --config train_pipeline/models_sota_short/sota_config.json --side short --dry-run
 ```
 
 ---
 
-## PATH C — Scalper (London-NY overlap, high-frequency)
+## GBPUSD (same commands, different bin-size)
 
 ```powershell
-python live_scalper_trading.py --dry-run --min-prob 0.52
-python live_scalper_trading.py --min-prob 0.52       # real orders
+# Fetch from Dukascopy
+python train_pipeline/fetch_data_dukascopy.py --symbol GBPUSD --from 2020-01-01 --to 2026-04-10 --out train_pipeline/data/gbpusd_m1_dukas.csv
 
-# 24h mode:
-python live_scalper_trading.py --session-start-utc 0 --session-end-utc 24 --min-prob 0.52
+# Synthetic micro (bin-size 0.0001 for forex pips)
+python train_pipeline/synthetic_microstructure.py --m1 train_pipeline/data/gbpusd_m1_dukas.csv --out train_pipeline/data/gbpusd_m1_synmicro.csv --vp-window 240 --bin-size 0.0001 --ofi-window 20
+
+# Labels and training — same as XAUUSD, just change paths
 ```
 
 ---
 
-## Key CLI Parameters
+## Key Notes
 
-| Flag | Default | Purpose |
-|------|---------|---------|
-| `--dry-run` | off | Log decisions without placing orders |
-| `--min-prob` | 0.55 (SOTA) / 0.52 (scalper) | Minimum calibrated long probability |
-| `--pt-atr` | 2.0 | Take profit multiplier on ATR |
-| `--sl-atr` | 1.0 | Stop loss multiplier on ATR |
-| `--max-hold` | 30 | Max bars before time-based exit |
-| `--use-gpu` | off | Enable GPU training (OpenCL) |
-| `--interval` | 10 | Seconds between live scans |
-
----
-
-## What Changed (vs old bidirectional system)
-
-| Component | Old | New |
-|-----------|-----|-----|
-| Labels | -1=SELL, 0=HOLD, +1=BUY | 0=WAIT, 1=LONG |
-| Model output | 3-class probabilities | Binary p_long |
-| Action space | Continuous [-1, 1] | Discrete {0, 1} |
-| TP/SL ratio | Variable (1.8-3.5) | Fixed 2:1 |
-| Exit logic | Trailing + partials + breakeven | Fixed levels at entry |
-| Short trades | Allowed | Never opened |
-
----
-
-## GPU Notes (AMD RX 6700 XT)
-
-- LightGBM uses OpenCL — works out of the box on Windows with `--use-gpu`
-- PatchTST falls back through CUDA -> MPS -> DirectML -> CPU
-- For transformer training, prefer larger batch sizes and `float32`
-- On Linux/WSL with ROCm, the transformer path becomes much faster
+- Both models use **identical binary architecture** — only the training labels differ
+- Labels have the same structure (`0=wait, 1=enter`), the `--side` flag controls which direction the barriers are placed
+- Each bot opens at most 1 position at a time (FTMO rule)
+- `--dry-run` logs everything without placing real orders
+- Use `--use-gpu` for AMD OpenCL acceleration; omit for CPU-only
