@@ -269,7 +269,7 @@ def get_all_feature_names() -> list:
     return out
 
 
-def build_features(df: pd.DataFrame, lookback: int = 10) -> pd.DataFrame:
+def build_features(df: pd.DataFrame, lookback: int = 60) -> pd.DataFrame:
     """Create feature matrix with ATR-normalized return lags (1b) + synmicro columns (1c).
 
     Removes current_position / current_balance (1a).
@@ -297,7 +297,7 @@ def build_features(df: pd.DataFrame, lookback: int = 10) -> pd.DataFrame:
                 ret_lags.append(0.0)
             else:
                 atr_prev = atr[lag_i - 1] if np.isfinite(atr[lag_i - 1]) and atr[lag_i - 1] > 0 else 0.01
-                ret_lags.append((close[lag_i] - close[lag_i - 1]) / atr_prev)
+                ret_lags.append(np.clip((close[lag_i] - close[lag_i - 1]) / atr_prev, -10, 10))
 
         row = list(ret_lags) + [
             float(latest["RSI"]),
@@ -323,7 +323,7 @@ def build_features(df: pd.DataFrame, lookback: int = 10) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=all_names)
 
 
-def build_labels(df, lookback=10, horizon=5, long_threshold=0.0005) -> pd.Series:
+def build_labels(df, lookback=60, horizon=5, long_threshold=0.0005) -> pd.Series:
     """Sync labels with the lookback shift in build_features. Binary: 0=WAIT, 1=LONG."""
     close = df["close"].values
     n = len(close)
@@ -436,14 +436,10 @@ def walk_forward_lgbm(
         X_val   = X_role.iloc[val_idx].astype(np.float32).values
         y_train_enc, y_val_enc = y_enc[train_idx], y_enc[val_idx]
 
-        # weights based on class imbalance
-        y_train_orig = y.iloc[train_idx].reset_index(drop=True)
-        sample_weight = compute_sample_weights(y_train_orig)
-
         params = get_lgbm_params(role, device_type)
         n_est = params.pop("n_estimators", 500)
 
-        train_data = lgb.Dataset(X_train, label=y_train_enc, weight=sample_weight)
+        train_data = lgb.Dataset(X_train, label=y_train_enc)
         val_data = lgb.Dataset(X_val, label=y_val_enc, reference=train_data)
 
         model = lgb.train(
@@ -671,7 +667,7 @@ def parse_args():
     )
     parser.add_argument("--data",              required=True)
     parser.add_argument("--horizon",           type=int,   default=5)
-    parser.add_argument("--lookback",          type=int,   default=10)
+    parser.add_argument("--lookback",          type=int,   default=60)
     parser.add_argument("--long-threshold",    type=float, default=0.0005)
     parser.add_argument("--label-col",         type=str,   default=None, help="Use existing label column from CSV")
     parser.add_argument("--expanded-features", action="store_true")
@@ -740,13 +736,12 @@ def main():
             model, summary = walk_forward_lgbm(X, y, role, device_type, args.n_splits)
             logger.info(f"\nRefitting [{role}] on full dataset...")
             y_enc = y.values.astype(int)
-            full_weight = compute_sample_weights(y)
             params = get_lgbm_params(role, device_type)
             n_est = params.pop("n_estimators", 500)
             # Use only this role's features for full-dataset refit
             role_feats = [f for f in MODEL_CONFIGS[role]["features"] if f in X.columns]
             X_role = X[role_feats].astype(np.float32).values
-            full_data = lgb.Dataset(X_role, label=y_enc, weight=full_weight)
+            full_data = lgb.Dataset(X_role, label=y_enc)
             model = lgb.train(params, full_data, num_boost_round=n_est)
             path = save_lgbm_model(
                 model, role, args.out_dir, args.horizon,

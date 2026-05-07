@@ -123,7 +123,7 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_obs_from_rates(rates, lookback: int = 10, expanded: bool = False, micro: bool = False, current_pos=0.0, balance=10000.0):
+def build_obs_from_rates(rates, lookback: int = 60, expanded: bool = False, micro: bool = False, current_pos=0.0, balance=10000.0):
     """Convert MT5 rate array -> single-row observation DataFrame with dynamic lookback."""
     df = pd.DataFrame(rates)
     if "time" in df.columns:
@@ -208,7 +208,7 @@ class EnsembleGPU:
         self.models = models
         self.metadata = metadata
         self.expanded = metadata.get("expanded_features", False)
-        self.lookback = metadata.get("lookback", 10)
+        self.lookback = metadata.get("lookback", 60)
         self.backend = metadata.get("backend", "unknown")
         self.gpu_used = metadata.get("gpu_used", False)
         self.micro = metadata.get("microstructure_features", False) or metadata.get("micro", False)

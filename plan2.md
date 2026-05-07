@@ -1,68 +1,39 @@
-Step 1 — Fix train_ensemble_gpu.py (All 3 Problems Live Here)
-Tell your coding agent to make these changes in this order:
-
-1a. Remove current_position and current_balance from features
-These are live-state variables. Delete them from build_feature_matrix() entirely.
-
-1b. Replace close_lag_* with normalized returns
+Bug 1 — Lookback not wired into vectorized feature builder
+In build_features(), the shift loop must use the lookback parameter:
 
 python
-# Delete this pattern:
-close_lag_{n} = close.shift(n)
+# Wrong — hardcoded range:
+for i in range(10):
+    X[f"return_lag_{i}"] = ...
 
-# Replace with:
-return_lag_{n} = (close.shift(n) - close.shift(n+1)) / atr.shift(n)
-1c. Wire in the synmicro columns
-In build_feature_matrix(), explicitly append these columns from the loaded dataframe if they exist:
+# Correct — use the passed lookback:
+for i in range(lookback):
+    X[f"return_lag_{i}"] = (
+        (df["close"].shift(i) - df["close"].shift(i + 1)) / df["ATR"].shift(i)
+    ).clip(-10, 10)
+After this fix, with --lookback 60 you should see return_lag_0 through return_lag_59 — 60 features just from price lags, plus the 16 indicator/micro features = ~76 total.
 
-python
-MICRO_COLS = [
-    'tick_imbalance', 'ofi_window', 'cs_spread',
-    'kyle_lambda', 'amihud', 'vprof_poc_dist',
-    'jump_flag', 'regime_flag'
-]
-Fill NaNs with 0 before appending (already partially null per the synmicro log).
-
-1d. Split models into 3 genuinely different configs
+Bug 2 — scale_pos_weight is now too low (or zero)
+The correct value for a 2:1 class imbalance (1M WAIT vs 512K LONG) is not 1.0 and not 2.0. It is 1.3 — a gentle partial rebalance. Set this explicitly in get_lgbm_params() for all three roles and make absolutely sure nothing overrides it afterward:
 
 python
-MODEL_CONFIGS = {
-    "trend": {
-        "features": ["return_lag_*", "RSI", "MACD", "atr_norm", "ema_ratio"],
-        "num_leaves": 63, "max_depth": 6, "min_child_samples": 300,
-        "scale_pos_weight": 1.3, "lambda_l1": 0.1, "lambda_l2": 0.1
-    },
-    "structure": {
-        "features": ["ofi_window", "tick_imbalance", "cs_spread",
-                     "kyle_lambda", "vprof_poc_dist"],
-        "num_leaves": 127, "max_depth": 8, "min_child_samples": 100,
-        "scale_pos_weight": 1.3, "lambda_l1": 0.05, "lambda_l2": 0.05
-    },
-    "regime": {
-        "features": ["atr_pct", "amihud", "jump_flag",
-                     "regime_flag", "vol_zscore"],
-        "num_leaves": 31, "max_depth": 4, "min_child_samples": 500,
-        "scale_pos_weight": 1.2, "lambda_l1": 0.2, "lambda_l2": 0.2
-    }
-}
-Step 2 — Re-run Training (Same Commands, No Changes Needed)
-Once the code is fixed, re-run exactly the same pipeline commands you already ran. No need to re-run synthetic_microstructure.py or triple_barrier_labels.py — those outputs are already correct and saved.
+# In get_lgbm_params(), add to base dict:
+"scale_pos_weight": 1.3,
 
-powershell
-python train_pipeline/train_ensemble_gpu.py `
-    --data train_pipeline/data/xauusd_m1_tb_long.csv `
-    --label-col tb_label --expanded-features --microstructure-features `
-    --use-gpu --out-dir train_pipeline/models_gpu_long
+# In walk_forward_lgbm() — DELETE these lines entirely:
+n_neg = (y_train_enc == 0).sum()
+n_pos = max((y_train_enc == 1).sum(), 1)
+params["scale_pos_weight"] = n_neg / n_pos   # ← DELETE
 
-python train_pipeline/train_ensemble_gpu.py `
-    --data train_pipeline/data/xauusd_m1_tb_short.csv `
-    --label-col tb_label --expanded-features --microstructure-features `
-    --use-gpu --out-dir train_pipeline/models_gpu_short
-Step 3 — Validate Before Proceeding
-After the retrain, check these 3 things in the logs before doing anything else:
+# In main() refit block — DELETE these lines entirely:
+n_neg_full = (y_enc == 0).sum()
+n_pos_full = max((y_enc == 1).sum(), 1)
+params["scale_pos_weight"] = n_neg_full / n_pos_full  # ← DELETE
+Also remove weight=sample_weight from both lgb.Dataset() calls. Using both scale_pos_weight AND sample_weight simultaneously is the root cause of the oscillation between always-LONG and always-WAIT.
 
-Check	Pass condition	Fail = do this
-Three different F1 scores	trend F1 ≠ structure F1 ≠ regime F1	1d not applied correctly
-WAIT recall > 0.45	Not stuck predicting always-LONG	Lower scale_pos_weight further to 1.1
-Micro features in feature list	tick_imbalance, ofi_window visible in feature log	1c not wired in
-Only move to PatchTST / sota_signal_generator.py training after all 3 checks pass.
+Expected After Both Fixes
+text
+Features: 76  ← 60 return lags + 16 indicators/micro
+[trend]     Fold 1 | Acc: ~0.61  F1: ~0.57  LONG recall: ~0.58
+[structure] Fold 1 | Acc: ~0.58  F1: ~0.54  LONG recall: ~0.55
+[regime]    Fold 1 | Acc: ~0.55  F1: ~0.51  LONG recall: ~0.52
