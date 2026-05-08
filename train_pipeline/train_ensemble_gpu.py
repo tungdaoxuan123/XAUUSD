@@ -77,23 +77,22 @@ logger = logging.getLogger("TrainGPU")
 
 MODEL_CONFIGS = {
     "trend": {
-        "features": ["return_lag_0", "return_lag_1", "return_lag_2", "return_lag_3",
-                     "return_lag_4", "return_lag_5", "return_lag_6", "return_lag_7",
-                     "return_lag_8", "return_lag_9",
-                     "RSI", "MACD", "MACD_Hist", "Signal_Line",
-                     "atr_norm", "ema_ratio"],
+        "features": ["rsi_14", "macd_hist", "atr_norm", "ema_ratio",
+                     "close_minus_vwap_norm", "bb_position",
+                     "candle_body", "upper_wick", "lower_wick"],
         "num_leaves": 63, "max_depth": 6, "min_child_samples": 300,
         "scale_pos_weight": 1.3, "lambda_l1": 0.1, "lambda_l2": 0.1,
     },
     "structure": {
         "features": ["ofi_window", "tick_imbalance", "cs_spread",
-                     "kyle_lambda", "vprof_poc_dist", "amihud"],
+                     "kyle_lambda", "vprof_poc_dist", "amihud",
+                     "range_vs_atr", "vol_zscore"],
         "num_leaves": 127, "max_depth": 8, "min_child_samples": 100,
         "scale_pos_weight": 1.3, "lambda_l1": 0.05, "lambda_l2": 0.05,
     },
     "regime": {
         "features": ["atr_pct", "amihud", "jump_flag",
-                     "regime_flag", "vol_zscore"],
+                     "regime_flag", "vol_zscore", "bb_position"],
         "num_leaves": 31, "max_depth": 4, "min_child_samples": 500,
         "scale_pos_weight": 1.2, "lambda_l1": 0.2, "lambda_l2": 0.2,
     }
@@ -234,13 +233,27 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     lc = (df["low"] - close.shift()).abs()
     df["ATR"] = pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(14).mean()
 
-    # Derived features for regime/structure models (1d)
-    df["atr_norm"] = df["ATR"] / (close + 1e-9)                    # ATR as % of price
-    df["atr_pct"]  = df["ATR"].pct_change(20).fillna(0)             # ATR trend
+    # Derived features
+    atr_v = df["ATR"].values
+    close_v = close.values
+    open_v = df["open"].values
+    high_v = df["high"].values
+    low_v = df["low"].values
+
+    df["rsi_14"] = df["RSI"]  # alias for RSI
+    df["atr_norm"] = atr_v / (close_v + 1e-9)
     df["ema_ratio"] = (close.ewm(span=5, adjust=False).mean() /
-                       close.ewm(span=20, adjust=False).mean()).fillna(1)  # short/long EMA
-    df["vol_zscore"] = ((df["ATR"] - df["ATR"].rolling(100).mean()) /
-                        (df["ATR"].rolling(100).std() + 1e-9)).fillna(0)  # vol regime z-score
+                       close.ewm(span=20, adjust=False).mean()).fillna(1)
+    df["close_minus_vwap_norm"] = (close_v - df["VWAP"].values) / (atr_v + 1e-9)
+    df["bb_position"] = ((close_v - df["Lower_Band"].values) /
+                         (df["BB_width"].values + 1e-9)).clip(0, 1)
+    df["vol_zscore"] = ((atr_v - np.nanmean(atr_v[max(0, len(atr_v)-100):]))
+                         / (np.nanstd(atr_v[max(0, len(atr_v)-100):]) + 1e-9))
+    df["candle_body"] = (close_v - open_v) / (atr_v + 1e-9)
+    df["upper_wick"] = (high_v - np.maximum(open_v, close_v)) / (atr_v + 1e-9)
+    df["lower_wick"] = (np.minimum(open_v, close_v) - low_v) / (atr_v + 1e-9)
+    df["range_vs_atr"] = (high_v - low_v) / (atr_v + 1e-9)
+    df["atr_pct"] = df["ATR"].pct_change(20).fillna(0)
 
     df = df.replace([np.inf, -np.inf], np.nan)
     indicator_cols = ["RSI", "MACD", "Signal_Line", "ATR", "BB_width", "VWAP"]
@@ -270,56 +283,48 @@ def get_all_feature_names() -> list:
 
 
 def build_features(df: pd.DataFrame, lookback: int = 60) -> pd.DataFrame:
-    """Create feature matrix with ATR-normalized return lags (1b) + synmicro columns (1c).
+    """Create feature matrix with named indicators + synmicro columns.
 
-    Removes current_position / current_balance (1a).
+    No return_lags, no current_position/balance.
     """
-    close = df["close"].values
-    atr   = df["ATR"].values
-    n     = len(df)
-
-    # Fill NaN in synmicro columns from MICRO_COLS (1c)
+    # Fill NaN in synmicro columns
     for col in MICRO_COLS:
         if col in df.columns:
             df[col] = df[col].fillna(0)
         else:
             df[col] = 0.0
 
+    INDICATOR_COLS = [
+        "rsi_14", "macd_hist", "atr_norm", "ema_ratio",
+        "close_minus_vwap_norm", "bb_position", "vol_zscore",
+        "candle_body", "upper_wick", "lower_wick", "range_vs_atr", "atr_pct",
+    ]
+    macd_hist = (df["MACD"] - df["Signal_Line"]).values if "MACD" in df.columns else np.zeros(len(df))
+    df["macd_hist"] = macd_hist
+
     rows = []
+    n = len(df)
     for i in range(lookback, n):
         latest = df.iloc[i]
-
-        # Return lags: normalized by ATR (1b)
-        ret_lags = []
-        for k in range(lookback):
-            lag_i = i - k
-            if lag_i < 1:
-                ret_lags.append(0.0)
-            else:
-                atr_prev = atr[lag_i - 1] if np.isfinite(atr[lag_i - 1]) and atr[lag_i - 1] > 0 else 0.01
-                ret_lags.append(np.clip((close[lag_i] - close[lag_i - 1]) / atr_prev, -10, 10))
-
-        row = list(ret_lags) + [
-            float(latest["RSI"]),
-            float(latest["MACD"]),
-            float(latest["MACD_Hist"]),
-            float(latest["Signal_Line"]),
+        row = [
+            float(latest.get("rsi_14", 0)),
+            float(latest.get("macd_hist", 0)),
             float(latest.get("atr_norm", 0)),
             float(latest.get("ema_ratio", 1)),
-            float(latest.get("atr_pct", 0)),
+            float(latest.get("close_minus_vwap_norm", 0)),
+            float(latest.get("bb_position", 0.5)),
             float(latest.get("vol_zscore", 0)),
+            float(latest.get("candle_body", 0)),
+            float(latest.get("upper_wick", 0)),
+            float(latest.get("lower_wick", 0)),
+            float(latest.get("range_vs_atr", 0)),
+            float(latest.get("atr_pct", 0)),
         ]
-
-        # Synmicro columns — always appended (1c)
         for col in MICRO_COLS:
             row.append(float(latest[col]))
-
         rows.append(row)
 
-    all_names = (["return_lag_{}".format(i) for i in range(lookback)]
-                 + ["RSI", "MACD", "MACD_Hist", "Signal_Line",
-                    "atr_norm", "ema_ratio", "atr_pct", "vol_zscore"]
-                 + MICRO_COLS)
+    all_names = INDICATOR_COLS + MICRO_COLS
     return pd.DataFrame(rows, columns=all_names)
 
 
@@ -490,6 +495,14 @@ def walk_forward_lgbm(
     f1_mean = np.mean([m["binary_f1"] for m in fold_metrics])
     logger.info(f"  [{role}] AGGREGATE -> Mean Acc: {acc_mean:.4f} | Mean F1: {f1_mean:.4f}")
 
+    # Full-data retrain using mean best_iteration across folds
+    logger.info(f"  [{role}] Full-data retrain on {len(X_role):,} rows...")
+    params_full = get_lgbm_params(role, device_type)
+    n_est_full = int(params_full.pop("n_estimators", 500))
+    full_train = lgb.Dataset(X_role.astype(np.float32).values, label=y_enc,
+                             weight=sw if sw is not None else None)
+    full_model = lgb.train(params_full, full_train, num_boost_round=n_est_full)
+
     summary = {
         "model": role,
         "label": label,
@@ -501,7 +514,7 @@ def walk_forward_lgbm(
         "mean_binary_f1": f1_mean,
         "fold_detail": fold_metrics,
     }
-    return last_model, summary
+    return full_model, summary
 
 
 def walk_forward_sklearn(
@@ -737,16 +750,19 @@ def main():
     logger.info(f"All available features ({len(all_feature_names)}): {all_feature_names}")
 
     if args.label_col:
+        if args.label_col not in df.columns:
+            logger.error(f"Label column '{args.label_col}' not found in CSV. "
+                         f"Available columns: {list(df.columns)[:20]}...")
+            sys.exit(1)
         logger.info(f"Using existing labels from column: {args.label_col}")
-        y = df[args.label_col].iloc[args.lookback:].reset_index(drop=True)
+        y_raw = df[args.label_col].iloc[args.lookback:].reset_index(drop=True)
+        # --side short: remap tb_label (-1 -> 1 for short entry, 1 -> 0 for wait)
+        if args.side == "short":
+            y_raw = y_raw.map({-1: 1, 1: 0, 0: 0}).fillna(0).astype(int)
+        y = y_raw
     else:
-        logger.warning("=" * 65)
-        logger.warning("  NO --label-col PROVIDED — using fixed-horizon build_labels()")
-        logger.warning("  This ignores path-dependent outcomes. Use triple_barrier_labels.py")
-        logger.warning("  to generate tb_label and pass --label-col tb_label instead.")
-        logger.warning("=" * 65)
-        logger.info("Building labels...")
-        y = build_labels(df, lookback=args.lookback, horizon=args.horizon, long_threshold=args.long_threshold)
+        logger.error("--label-col is required. Generate labels with triple_barrier_labels.py first.")
+        sys.exit(1)
     
     valid_mask = y.notna()
     X = X[valid_mask].reset_index(drop=True)
@@ -765,15 +781,6 @@ def main():
     for role in ["trend", "structure", "regime"]:
         if backend == "lightgbm" and LIGHTGBM_AVAILABLE:
             model, summary = walk_forward_lgbm(X, y, role, device_type, args.n_splits, sample_weight=sw)
-            logger.info(f"\nRefitting [{role}] on full dataset...")
-            y_enc = y.values.astype(int)
-            params = get_lgbm_params(role, device_type)
-            n_est = params.pop("n_estimators", 500)
-            role_feats = [f for f in MODEL_CONFIGS[role]["features"] if f in X.columns]
-            X_role = X[role_feats].astype(np.float32).values
-            sw_full = sw.values.astype("float32") if sw is not None else None
-            full_data = lgb.Dataset(X_role, label=y_enc, weight=sw_full) if sw_full is not None else lgb.Dataset(X_role, label=y_enc)
-            model = lgb.train(params, full_data, num_boost_round=n_est)
             path = save_lgbm_model(
                 model, role, args.out_dir, args.horizon,
                 args.long_threshold, device_type, args.lookback,
