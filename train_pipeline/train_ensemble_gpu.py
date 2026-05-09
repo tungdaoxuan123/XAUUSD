@@ -170,7 +170,7 @@ def detect_gpu_backend(requested_backend: str, use_gpu: bool) -> tuple:
 REQUIRED_COLUMNS = {"time", "open", "high", "low", "close", "tick_volume"}
 
 
-def load_data(csv_path: str) -> pd.DataFrame:
+def load_data(csv_path: str, label_col: str = None, side: str = "long") -> pd.DataFrame:
     logger.info(f"Loading data from: {csv_path}")
     if not os.path.exists(csv_path):
         logger.error(f"File not found: {csv_path}")
@@ -184,6 +184,15 @@ def load_data(csv_path: str) -> pd.DataFrame:
     df["time"] = pd.to_datetime(df["time"])
     df = df.sort_values("time").reset_index(drop=True)
     logger.info(f"Loaded {len(df):,} rows | {df['time'].iloc[0]} -> {df['time'].iloc[-1]}")
+
+    if label_col:
+        if label_col not in df.columns:
+            logger.error(f"Label column '{label_col}' not in CSV. Columns: {list(df.columns)[:20]}...")
+            sys.exit(1)
+        # --side short: remap tb_label (-1 -> 1 short, 1 -> 0 wait)
+        if side == "short":
+            df[label_col] = df[label_col].map({-1: 1, 1: 0, 0: 0}).fillna(0).astype(int)
+        logger.info(f"Labels loaded | distribution: {df[label_col].value_counts().sort_index().to_dict()}")
     return df
 
 
@@ -326,23 +335,6 @@ def build_features(df: pd.DataFrame, lookback: int = 60) -> pd.DataFrame:
 
     all_names = INDICATOR_COLS + MICRO_COLS
     return pd.DataFrame(rows, columns=all_names)
-
-
-def build_labels(df, lookback=60, horizon=5, long_threshold=0.0005) -> pd.Series:
-    """Sync labels with the lookback shift in build_features. Binary: 0=WAIT, 1=LONG."""
-    close = df["close"].values
-    n = len(close)
-    labels = []
-
-    # Must match range(lookback, n) in build_features
-    for i in range(lookback, n):
-        fi = i + horizon
-        if fi >= n:
-            labels.append(np.nan)
-        else:
-            ret = (close[fi] - close[i]) / close[i]
-            labels.append(1 if ret > long_threshold else 0)
-    return pd.Series(labels, name="label")
 
 
 # ==========================================================================='
@@ -738,31 +730,30 @@ def main():
     backend, device_type, gpu_active = detect_gpu_backend(args.gpu_backend, args.use_gpu)
     logger.info(f"GPU active: {gpu_active} | Backend: {backend} | Device: {device_type}")
 
-    # Load & process data
-    df_raw = load_data(args.data)
+    # Load & process data (labels loaded+remapped in load_data)
+    df_raw = load_data(args.data, label_col=args.label_col, side=args.side)
     logger.info("Computing technical indicators...")
     df = add_technical_indicators(df_raw)
-    logger.info(f"After indicators: {len(df):,} rows")
+    logger.info(f"After indicators: {len(df):,} rows (dropped {len(df_raw)-len(df):,})")
+    if args.label_col:
+        # Diagnostic: verify label alignment at sample row
+        di = 30
+        if di < len(df):
+            logger.info(f"  -- Diag: close[{di}]={df['close'].iloc[di]:.4f} "
+                        f"tb_label[{di}]={df[args.label_col].iloc[di]}")
+        logger.info(f"Labels after indicator dropna: {df[args.label_col].value_counts().sort_index().to_dict()}")
 
     logger.info("Building feature matrix...")
     X = build_features(df, lookback=args.lookback)
     all_feature_names = get_all_feature_names()
     logger.info(f"All available features ({len(all_feature_names)}): {all_feature_names}")
 
-    if args.label_col:
-        if args.label_col not in df.columns:
-            logger.error(f"Label column '{args.label_col}' not found in CSV. "
-                         f"Available columns: {list(df.columns)[:20]}...")
-            sys.exit(1)
-        logger.info(f"Using existing labels from column: {args.label_col}")
-        y_raw = df[args.label_col].iloc[args.lookback:].reset_index(drop=True)
-        # --side short: remap tb_label (-1 -> 1 for short entry, 1 -> 0 for wait)
-        if args.side == "short":
-            y_raw = y_raw.map({-1: 1, 1: 0, 0: 0}).fillna(0).astype(int)
-        y = y_raw
-    else:
-        logger.error("--label-col is required. Generate labels with triple_barrier_labels.py first.")
-        sys.exit(1)
+    # Labels from same df, aligned by lookback shift
+    y = df[args.label_col].iloc[args.lookback:].reset_index(drop=True)
+
+    valid_mask = y.notna()
+    X = X[valid_mask].reset_index(drop=True)
+    y = y[valid_mask].reset_index(drop=True).astype(int)
     
     valid_mask = y.notna()
     X = X[valid_mask].reset_index(drop=True)
