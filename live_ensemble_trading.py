@@ -1,353 +1,322 @@
-import pandas as pd
-import numpy as np
-from ensemble_trader import EnsembleTrader
-from market_regime_detector import MarketRegimeDetector
-from trading_env import TradingEnv
-import time
+"""
+live_ensemble_trading.py — Meta-Labeling v3 Live Bot
+=====================================================
+
+Event-based execution with calibrated dual-model dispatch.
+Supports long, short, or both simultaneously.
+
+On each bar:
+  1. Check Setup A (long) and Setup B (short) primary signal conditions
+  2. If condition fires -> compute features -> model predict -> calibrate
+  3. If calibrated p >= threshold -> place order (2:1 TP/SL via ATR)
+  4. Block signals while position open
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
 import logging
+import os
+import time
 from datetime import datetime, timedelta
+from typing import Optional
+
+import numpy as np
+import pandas as pd
 
 from config import Settings, setup_logging
 from mt5_interface import MT5Interface
 from risk_manager import FTMORiskManager
-from train_pipeline.ensemble_gpu import EnsembleGPU, _add_indicators
 
-# Setup MT5-aware logging
 logger = setup_logging()
 
-class LiveEnsembleTrader:
-    """
-    Live trading system adapted for FTMO MT5 Challenge using ensemble predictions
-    """
 
-    def __init__(self, ensemble_path=None):
+class DirectionModel:
+    """Loads a single trained model + calibrator + metadata."""
+
+    def __init__(self, model_dir: str, side: str):
+        self.side = side
+        self.dir_val = 1 if side == "long" else -1
+
+        meta_path = os.path.join(model_dir, "ensemble_metadata.json")
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(f"Metadata not found: {meta_path}")
+        with open(meta_path) as f:
+            self.meta = json.load(f)
+
+        self.features = self.meta.get("features", [])
+        self.threshold = self.meta.get("threshold", 0.5)
+        logger.info(f"[{side.upper()}] Loaded | features={len(self.features)} | threshold={self.threshold:.2f}")
+
+        self.model = self._load_model(model_dir)
+        self.calibrator = self._load_calibrator(model_dir)
+
+    def _load_model(self, d: str):
+        import lightgbm as lgb
+        try:
+            mp = os.path.join(d, "model.txt")
+            return lgb.Booster(model_file=mp)
+        except Exception:
+            import joblib
+            return joblib.load(os.path.join(d, "model.joblib"))
+
+    def _load_calibrator(self, d: str):
+        import joblib
+        cp = os.path.join(d, f"calibrator_{self.side}.pkl")
+        if os.path.exists(cp):
+            return joblib.load(cp)
+        return None
+
+    def predict_calibrated(self, X: np.ndarray) -> float:
+        try:
+            p_raw = self.model.predict(X.astype(np.float32))
+            if hasattr(p_raw, "__len__"):
+                p_raw = float(p_raw[0])
+            else:
+                p_raw = float(p_raw)
+        except Exception:
+            try:
+                p_raw = float(self.model.predict_proba(X)[0, 1])
+            except Exception:
+                return 0.0
+
+        if self.calibrator is not None:
+            try:
+                p_cal = self.calibrator.predict_proba(X.reshape(1, -1))[0, 1]
+                return float(p_cal)
+            except Exception:
+                pass
+        return float(p_raw)
+
+
+class LiveEnsembleTrader:
+    """Dual-model live bot with primary signal filter + calibration."""
+
+    def __init__(self, long_dir: str = None, short_dir: str = None):
         self.settings = Settings
         self.interface = MT5Interface()
         self.risk_mgr = FTMORiskManager(self.interface)
-        
-        # Load the new GPU/Microstructure ensemble
-        model_path = ensemble_path or self.settings.ENSEMBLE_MODEL_PATH
-        self.ensemble = EnsembleGPU.load(model_path)
 
-        # Initialize risk settings for scalping (FTMO 10k)
-        # Load thresholds
-        self.buy_threshold = self.settings.BUY_THRESHOLD
-        self.sell_threshold = self.settings.SELL_THRESHOLD
-        self.buy_confidence = self.settings.BUY_CONFIDENCE
-        self.sell_confidence = self.settings.SELL_CONFIDENCE
+        self.long_model = DirectionModel(long_dir, "long") if long_dir else None
+        self.short_model = DirectionModel(short_dir, "short") if short_dir else None
 
-        self.partial_closed_tickets = set()
-        
-        # Symbol discovery
-        self.current_symbol = self.interface.symbol
         if not self.interface.authorized:
             self.interface.initialize()
-            self.current_symbol = self.interface.symbol
+        self.symbol = self.interface.symbol
+        logger.info(f"Dual-model bot ready | symbol={self.symbol}")
 
-        logger.info(f"Initialized BTC-Micro-Ready Live Bot - Symbol: {self.current_symbol}")
-        logger.info(f"Model: {model_path} | Micro: {self.ensemble.micro}")
+    def _compute_indicators(self, df):
+        close = df["close"]
+        high = df["high"]
+        low = df["low"]
+        vol = df["tick_volume"].replace(0, np.nan).ffill().fillna(1)
 
-    def calculate_atr(self, rates, period=14):
-        """Calculates Average True Range from MT5 rates"""
-        df = pd.DataFrame(rates)
-        high_low = df['high'] - df['low']
-        high_close = np.abs(df['high'] - df['close'].shift())
-        low_close = np.abs(df['low'] - df['close'].shift())
-        tr = np.maximum(high_low, np.maximum(high_close, low_close))
-        return tr.rolling(period).mean().iloc[-1]
+        df["EMA5"] = close.ewm(span=5, adjust=False).mean()
+        df["EMA20"] = close.ewm(span=20, adjust=False).mean()
+        tp = (high + low + close) / 3
+        df["VWAP"] = (tp * vol).cumsum() / vol.cumsum()
 
-    def build_micro_features(self, rates, ticks):
-        """Computes real-time microstructure features from raw MT5 ticks"""
-        if ticks is None or len(ticks) == 0:
-            return {f: 0.0 for f in ["tick_imbalance", "bid_ask_vol_imbalance", "spread_mean", "ofi_window", "of_pressure_flag", "vprof_poc_dist", "vprof_in_value_area", "vprof_hvn_flag", "vprof_lvn_flag"]}
+        hl = high - low
+        hc = (high - close.shift()).abs()
+        lc = (low - close.shift()).abs()
+        df["ATR"] = np.maximum(hl, np.maximum(hc, lc))
+        df["ATR"] = df["ATR"].rolling(14).mean()
 
-        t = pd.DataFrame(ticks)
-        t["time"] = pd.to_datetime(t["time"], unit="s")
-        t["mid"] = (t["bid"] + t["ask"]) / 2.0
-        
-        # 1. Order Flow (latest 100 ticks)
-        t_recent = t.iloc[-100:].copy()
-        t_recent["prev_mid"] = t_recent["mid"].shift(1)
-        up = (t_recent["mid"] > t_recent["prev_mid"]).sum()
-        down = (t_recent["mid"] < t_recent["prev_mid"]).sum()
-        total = len(t_recent)
-        
-        tick_imba = (up - down) / (total + 1e-9)
-        spread_mean = (t_recent["ask"] - t_recent["bid"]).mean()
-        
-        # Price-based OFI
-        t_recent["prev_bid"] = t_recent["bid"].shift(1)
-        t_recent["prev_ask"] = t_recent["ask"].shift(1)
-        ofi = ((t_recent["bid"] > t_recent["prev_bid"]).sum() - (t_recent["bid"] < t_recent["prev_bid"]).sum()) \
-            - ((t_recent["ask"] > t_recent["prev_ask"]).sum() - (t_recent["ask"] < t_recent["prev_ask"]).sum())
-        
-        # 2. Volume Profile (last 2000 ticks)
-        # Use symbol-aware bin size: 0.10 for XAUUSD, 10.0 for BTCUSD
-        bin_dist = 0.10 if "XAU" in self.current_symbol else 10.0
-        bins = (t["mid"] / bin_dist).round() * bin_dist
-        counts = bins.value_counts()
-        poc_bin = counts.idxmax()
-        
-        current_price = t["mid"].iloc[-1]
-        atr = self.calculate_atr(rates)
-        poc_dist = (current_price - poc_bin) / (atr + 1e-9)
-        
-        # Value Area (approximate)
-        total_vol = counts.sum()
-        sorted_counts = counts.sort_index()
-        cumsum = sorted_counts.cumsum()
-        va_low = sorted_counts.index[cumsum >= total_vol * 0.15][0]
-        va_high = sorted_counts.index[cumsum >= total_vol * 0.85][0]
-        
-        return {
-            "tick_imbalance": float(tick_imba),
-            "bid_ask_vol_imbalance": float(tick_imba), # Proxy
-            "spread_mean": float(spread_mean),
-            "ofi_window": float(ofi / 100.0),
-            "of_pressure_flag": 1 if tick_imba > 0.2 else (-1 if tick_imba < -0.2 else 0),
-            "vprof_poc_dist": float(poc_dist),
-            "vprof_in_value_area": 1 if va_low <= current_price <= va_high else 0,
-            "vprof_hvn_flag": 1 if counts[poc_bin] > counts.mean() * 2 else 0,
-            "vprof_lvn_flag": 0 # Not stable in real-time
-        }
+        # RSIt
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta).clip(lower=0).rolling(14).mean()
+        df["RSI"] = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
 
-    def get_observation_from_rates(self, rates, ticks=None):
-        """Prepare feature vector matching the 79-feature BTC micro model"""
-        df = pd.DataFrame(rates)
-        df["time"] = pd.to_datetime(df["time"], unit="s")
-        df = _add_indicators(df)
-        
-        lookback = self.ensemble.lookback
-        if len(df) < lookback:
+        ema8 = close.ewm(span=8, adjust=False).mean()
+        ema24 = close.ewm(span=24, adjust=False).mean()
+        df["MACD_Hist"] = (ema8 - ema24) - (ema8 - ema24).ewm(span=9, adjust=False).mean()
+
+        # BBands
+        sma20 = close.rolling(20).mean()
+        std20 = close.rolling(20).std()
+        df["Upper_Band"] = sma20 + std20 * 2
+        df["Lower_Band"] = sma20 - std20 * 2
+        df["BB_width"] = df["Upper_Band"] - df["Lower_Band"]
+
+        return df.dropna().reset_index(drop=True)
+
+    def _check_setup(self, df, side: int) -> bool:
+        """Check if the EMA pullback setup fires on the latest bar."""
+        if len(df) < 3:
+            return False
+        close = df["close"].values
+        ema5 = df["EMA5"].values
+        ema20 = df["EMA20"].values
+        vwap = df["VWAP"].values
+        atr14 = df["ATR"].values
+
+        i = len(df) - 1
+        atr50 = np.nanmean(atr14[max(0, i - 50):i + 1])
+        vol_ok = atr14[i] > atr50 * 0.8
+        if not vol_ok:
+            return False
+
+        if side > 0:
+            return (close[i] > vwap[i] and ema5[i] > ema20[i] and
+                    close[i - 1] < ema20[i - 1] and close[i] > ema20[i])
+        else:
+            return (close[i] < vwap[i] and ema5[i] < ema20[i] and
+                    close[i - 1] > ema20[i - 1] and close[i] < ema20[i])
+
+    def _compute_live_features(self, df):
+        """Mirror of train_ensemble_gpu.compute_features on a small window."""
+        close = df["close"].values.astype("float64")
+        high = df["high"].values.astype("float64")
+        low = df["low"].values.astype("float64")
+        open_v = df["open"].values.astype("float64")
+        atr = df["ATR"].values.astype("float64")
+        rsi = df["RSI"].values.astype("float64")
+        vwap = df["VWAP"].values.astype("float64")
+        macd_h = df["MACD_Hist"].values.astype("float64")
+        ema5 = df["EMA5"].values.astype("float64")
+        ema20 = df["EMA20"].values.astype("float64")
+        vol = df.get("tick_volume", pd.Series(np.ones(len(df)))).values.astype("float64")
+
+        i = len(df) - 1
+        if i < 15:
             return None
-            
-        latest_idx = len(df) - 1
-        price_lags = df["close"].iloc[latest_idx - lookback + 1 : latest_idx + 1].values
-        feat_latest = df.iloc[latest_idx]
-        
-        # Basic + Expanded Features
-        obs = list(price_lags) + [
-            float(feat_latest["RSI"]),
-            float(feat_latest["MACD"]),
-            float(feat_latest["Signal_Line"]),
-            0.0, # pos
-            10000.0, # balance
-            float(feat_latest["MACD_Hist"]),
-            float(feat_latest["VWAP"]),
-            float(feat_latest["close_minus_vwap"]),
-            float(feat_latest["ATR"]),
-            float(feat_latest["BB_width"]),
-        ]
-        
-        # Micro Features
-        if self.ensemble.micro:
-            micro = self.build_micro_features(rates, ticks)
-            obs += [
-                micro["tick_imbalance"], micro["bid_ask_vol_imbalance"], micro["spread_mean"],
-                micro["ofi_window"], micro["of_pressure_flag"],
-                micro["vprof_poc_dist"], micro["vprof_in_value_area"], micro["vprof_hvn_flag"], micro["vprof_lvn_flag"]
-            ]
-            
-        return np.array(obs).reshape(1, -1)
 
-    def monitor_trailing(self):
-        """Dynamic ATR + R-multiple trailing for XAUUSD volatility"""
-        positions = self.interface.get_positions()
-        
-        if not positions:
-            if np.random.random() < 0.05: # Heartbeat every ~2 mins
-                 logger.info("Monitor: Scanning for opportunities...")
-            # Clean up old tickets from tracking set
-            if len(self.partial_closed_tickets) > 0:
-                self.partial_closed_tickets.clear()
-            return
-        
-        rates = self.interface.get_rates(count=50)  # Fresh ATR data
-        if rates is None or len(rates) < 20:
-            return
-            
-        atr = self.calculate_atr(rates, period=14)  # Current volatility
-        
-        for pos in positions:
-            entry = pos.price_open
-            current = pos.price_current
-            sl = pos.sl or 0
-            ticket = pos.ticket
-            
-            # XAUUSD 0.1 move = 1 pip (standard)
-            # profit_pips calculation: 1.00 price move = 10 pips (for 100 points brokers)
-            profit_pips = (current - entry) * 10 if pos.type == 0 else (entry - current) * 10
-            
-            # Calculate dynamic R based on actual ATR distance if SL is 0, else initial SL distance
-            initial_sl_dist = abs(entry - sl) if sl != 0 else atr * 2
-            current_r = profit_pips / (initial_sl_dist * 10) if initial_sl_dist > 0 else 0
-            
-            # 1. 2R+ -> Full Exit
-            if current_r >= 2.0:
-                logger.info(f"2R+ TARGET REACHED: Closing {ticket} | R: {current_r:.1f} | Pips: {profit_pips:.1f}")
-                self.interface.close_position(ticket)
-                continue
-                
-            # 2. 1.5R -> Partial close 50%
-            if current_r >= 1.5 and ticket not in self.partial_closed_tickets:
-                half_vol = round(pos.volume / 2, 2)
-                if half_vol >= 0.01:
-                    logger.info(f"1.5R PARTIAL EXIT: {ticket} | R: {current_r:.1f} | Vol: {half_vol}")
-                    if self.interface.close_partial_position(ticket, half_vol):
-                        self.partial_closed_tickets.add(ticket)
-            
-            # 3. 1R+ -> Dynamic ATR Trail (0.8 ATR distance)
-            if current_r >= 1.0:
-                trail_dist = atr * 0.8  # Adaptive to volatility
-                
-                if pos.type == 0:  # BUY
-                    new_sl = current - trail_dist
-                    if new_sl > sl + (atr * 0.1):  # Only move if meaningful
-                        logger.info(f"ATR TRAIL BUY {ticket}: {sl:.2f} -> {new_sl:.2f} | ATR: {atr:.2f} | R: {current_r:.1f}")
-                        self.interface.modify_position(ticket, new_sl, pos.tp)
-                else:  # SELL
-                    new_sl = current + trail_dist
-                    if new_sl < sl - (atr * 0.1) or sl == 0:
-                        logger.info(f"ATR TRAIL SELL {ticket}: {sl:.2f} -> {new_sl:.2f} | ATR: {atr:.2f} | R: {current_r:.1f}")
-                        self.interface.modify_position(ticket, new_sl, pos.tp)
-            
-            # 4. 0.5R -> Breakeven + buffer
-            elif current_r >= 0.5:
-                buffer = atr * 0.3  # Dynamic buffer, not fixed pip
-                
-                if pos.type == 0:  # BUY
-                    if sl < entry:
-                        new_sl = entry + buffer
-                        logger.info(f"DYNAMIC BE+: BUY {ticket} -> {new_sl:.2f} (Buffer: {buffer:.2f})")
-                        self.interface.modify_position(ticket, new_sl, pos.tp)
-                else: # SELL
-                    if sl > entry or sl == 0:
-                        new_sl = entry - buffer
-                        logger.info(f"DYNAMIC BE+: SELL {ticket} -> {new_sl:.2f} (Buffer: {buffer:.2f})")
-                        self.interface.modify_position(ticket, new_sl, pos.tp)
+        feat = {}
+        feat["rsi_14"] = rsi[i]
+        feat["macd_hist"] = macd_h[i]
+        feat["atr_norm"] = atr[i] / (close[i] + 1e-9)
+        feat["ema_ratio"] = ema5[i] / (ema20[i] + 1e-9)
+        feat["close_minus_vwap_norm"] = (close[i] - vwap[i]) / (atr[i] + 1e-9)
+        feat["bb_position"] = np.clip((close[i] - (close[i - 20:i].mean() - close[i - 20:i].std() * 2))
+                                      / (close[i - 20:i].std() * 4 + 1e-9), 0, 1)
+        feat["candle_body"] = (close[i] - open_v[i]) / (atr[i] + 1e-9)
+        feat["upper_wick"] = (high[i] - max(open_v[i], close[i])) / (atr[i] + 1e-9)
+        feat["lower_wick"] = (min(open_v[i], close[i]) - low[i]) / (atr[i] + 1e-9)
+        feat["vol_zscore"] = (atr[i] - np.nanmean(atr[max(0, i - 100):i]))
+        feat["vol_zscore"] /= (np.nanstd(atr[max(0, i - 100):i]) + 1e-9)
+        feat["range_vs_atr"] = (high[i] - low[i]) / (atr[i] + 1e-9)
 
-    def run_live_trading(self, interval_seconds=10, dry_run=False):
-        """Main FTMO trading loop with specified intervals"""
-        logger.info(f"Starting FTMO MT5 Trading Session ({interval_seconds}-second intervals)...")
-        
+        feat["pullback_speed"] = (close[i] - close[i - 5]) / (atr[i] * 5 + 1e-9)
+        feat["atr_ratio"] = atr[i] / (atr[i - 10] + 1e-9)
+        feat["vwap_slope_5"] = (vwap[i] - vwap[i - 5]) / (atr[i] + 1e-9)
+        feat["rsi_delta_5"] = rsi[i] - rsi[i - 5]
+        feat["volume_ratio"] = vol[i] / (np.mean(vol[max(0, i - 5):i]) + 1e-9)
+        feat["ema_gap"] = (ema5[i] - ema20[i]) / (atr[i] + 1e-9)
+        feat["ema_gap_delta"] = feat["ema_gap"] - (ema5[i - 5] - ema20[i - 5]) / (atr[i - 5] + 1e-9)
+
+        return feat
+
+    def run(self, interval_s: int = 10, dry_run: bool = False):
+        logger.info(f"Event-based live loop ({interval_s}s, dry_run={dry_run})")
         if not self.interface.initialize():
-            logger.error("Failed to initialize MT5 interface. Exiting.")
-            return
+            logger.error("MT5 init failed"); return
+        self.risk_mgr.initialize_balance()
 
-        if not self.risk_mgr.initialize_balance():
-            logger.error("Failed to fetch initial balance. Exiting.")
-            return
-
-        self.current_symbol = self.interface.symbol
-        last_update = datetime.now() - timedelta(seconds=interval_seconds)
-
+        last_update = datetime.now() - timedelta(seconds=interval_s)
         try:
             while True:
                 now = datetime.now()
-                # Check for trailing stops on active positions
-                self.monitor_trailing()
+                if (now - last_update).total_seconds() < interval_s:
+                    time.sleep(1); continue
+                last_update = now
 
-                # Safety check: Daily/Total Drawdown
-                if not self.risk_mgr.can_trade():
-                    account = self.interface.get_account_info()
-                    if account and (self.risk_mgr.day_start_balance - account.equity) / self.risk_mgr.day_start_balance * 100 >= self.settings.MAX_DAILY_LOSS_PCT:
-                        logger.critical("HARD STOP: Daily loss limit breached. Closing all positions.")
-                        self.interface.close_all_positions()
-                        break
-                    time.sleep(10) # Wait and check again
+                # Skip if position open
+                positions = self.interface.get_positions()
+                if positions and len(positions) > 0:
                     continue
 
-                # Execution loop
-                if (now - last_update).total_seconds() >= interval_seconds:
-                    # Fetch data - using buffer for indicator warm-up
-                    rates = self.interface.get_rates(count=self.ensemble.lookback + 100)
-                    ticks = self.interface.get_ticks(count=2000)
-                    
-                    if rates is not None and len(rates) >= self.ensemble.lookback:
-                        obs = self.get_observation_from_rates(rates, ticks)
-                        if obs is None:
-                            continue
-                            
-                        action, confidence = self.ensemble.predict(obs)
-                        
-                        current_price = rates[-1]['close']
-                        atr = self.calculate_atr(rates)
-                        
-                        # Confluence Check (MACD 8-24-9 + VWAP)
-                        df_temp = pd.DataFrame(rates)
-                        df_temp['time'] = pd.to_datetime(df_temp['time'], unit='s')
-                        df_temp = _add_indicators(df_temp)
-                        latest = df_temp.iloc[-1]
-                        
-                        bull_confirm = latest['MACD'] > latest['Signal_Line'] and latest['close'] > latest['VWAP']
-                        bear_confirm = latest['MACD'] < latest['Signal_Line'] and latest['close'] < latest['VWAP']
-                        
-                        # High-confidence signals with confluence
-                        is_buy = action > 0 and bull_confirm
-                        is_sell = action < 0 and bear_confirm
-                        
-                        # Buy/Sell Threshold Check
-                        is_buy_signal = action >= self.buy_threshold and confidence >= self.buy_confidence
-                        is_sell_signal = action <= -self.sell_threshold and confidence >= self.sell_confidence
-                        
-                        if is_buy_signal or is_sell_signal:
-                            # Calculate SL and TP based on ATR (2*ATR SL, 3*ATR TP)
-                            if action > 0: # BUY
-                                sl = current_price - (2 * atr)
-                                tp = current_price + (3 * atr)
-                            else: # SELL
-                                sl = current_price + (2 * atr)
-                                tp = current_price - (3 * atr)
-                                
-                            # Calculate lots with ATR-based stop distance points
-                            lots = self.risk_mgr.calculate_position_size(float(confidence), atr * 2)
-                            
-                            if lots > 0:
-                                if dry_run:
-                                    logger.info(f"DRY RUN: Would {'BUY' if action > 0 else 'SELL'} {lots} lots at {current_price} | SL: {sl:.2f} | TP: {tp:.2f}")
-                                else:
-                                    self.interface.send_order(action, lots, sl, tp)
-                                    time.sleep(2)
-                        
-                        last_update = now
-                        logger.info(f"Status - Price: {current_price:.2f} | Action: {float(action):.3f} | Confidence: {float(confidence):.3f}")
+                if not self.risk_mgr.can_trade():
+                    time.sleep(10); continue
 
-                time.sleep(10) # 10-second interval as requested
+                # Fetch data
+                rates = self.interface.get_rates(count=200)
+                if rates is None or len(rates) < 60:
+                    continue
+                df = pd.DataFrame(rates)
+                df = self._compute_indicators(df)
+                if len(df) < 60:
+                    continue
+
+                atr = df["ATR"].iloc[-1]
+                current_price = df["close"].iloc[-1]
+
+                # Check both setups
+                for model, side, condition in [
+                    (self.long_model, 1, self._check_setup(df, 1)),
+                    (self.short_model, -1, self._check_setup(df, -1)),
+                ]:
+                    if model is None or not condition:
+                        continue
+
+                    feat = self._compute_live_features(df)
+                    if feat is None:
+                        continue
+
+                    # Build feature vector in model's expected order
+                    f_list = [feat.get(f, 0.0) for f in model.features]
+                    X = np.array(f_list, dtype=np.float32)
+
+                    p_cal = model.predict_calibrated(X)
+                    side_label = "LONG" if side > 0 else "SHORT"
+                    logger.info(f"Setup {side_label}: p_cal={p_cal:.3f} (thresh={model.threshold:.2f})")
+
+                    if p_cal < model.threshold:
+                        logger.info(f"Skip {side_label}: p_cal={p_cal:.3f} < {model.threshold:.2f}")
+                        continue
+
+                    # Place order: SL = close -/+ 1*ATR, TP = close +/- 2*ATR
+                    sl_dist = atr * 1.0
+                    tp_dist = 2.0 * sl_dist
+                    if side > 0:
+                        sl = current_price - sl_dist
+                        tp = current_price + tp_dist
+                    else:
+                        sl = current_price + sl_dist
+                        tp = current_price - tp_dist
+
+                    lots = self.risk_mgr.calculate_position_size(float(p_cal), sl_dist)
+                    if lots <= 0:
+                        continue
+
+                    if dry_run:
+                        logger.info(f"DRY RUN: {side_label} {lots:.2f} lots @ {current_price:.2f} "
+                                    f"SL={sl:.2f} TP={tp:.2f}")
+                    else:
+                        self.interface.send_order(float(side), lots, sl, tp)
+                        time.sleep(2)
+                    break
 
         except KeyboardInterrupt:
-            logger.info("Stopped by user. Closing connection.")
+            logger.info("Stopped by user.")
         except Exception as e:
-            logger.error(f"Execution error: {e}")
+            logger.error(f"Error: {e}")
         finally:
             self.interface.shutdown()
 
+
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="Live FTMO Trading with AI Ensemble")
-    parser.add_argument("--dry-run", action="store_true", help="Monitor without placing trades")
-    parser.add_argument("--symbol", type=str, help="Override symbol in config")
-    parser.add_argument("--model", type=str, help="Override ensemble model path")
-    parser.add_argument("--interval", type=int, default=10, help="Timeframe interval in seconds")
-    parser.add_argument("--buy-thresh", type=float, help="Override BUY_THRESHOLD")
-    parser.add_argument("--sell-thresh", type=float, help="Override SELL_THRESHOLD")
-    parser.add_argument("--buy-conf", type=float, help="Override BUY_CONFIDENCE")
-    parser.add_argument("--sell-conf", type=float, help="Override SELL_CONFIDENCE")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Meta-Labeling v3 Live Bot")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--long-model", type=str, default=None, help="Path to long model dir")
+    ap.add_argument("--short-model", type=str, default=None, help="Path to short model dir")
+    ap.add_argument("--interval", type=int, default=10)
+    args = ap.parse_args()
 
-    if args.symbol:
-        Settings.SYMBOL = args.symbol
-    
-    model_path = args.model or Settings.ENSEMBLE_MODEL_PATH
+    long_dir = args.long_model or "train_pipeline/models_gpu_long"
+    short_dir = args.short_model or "train_pipeline/models_gpu_short"
 
-    trader = LiveEnsembleTrader(ensemble_path=model_path)
-    
-    # Apply overrides from CLI
-    if args.buy_thresh is not None: trader.buy_threshold = args.buy_thresh
-    if args.sell_thresh is not None: trader.sell_threshold = args.sell_thresh
-    if args.buy_conf is not None: trader.buy_confidence = args.buy_conf
-    if args.sell_conf is not None: trader.sell_confidence = args.sell_conf
+    if not os.path.exists(long_dir):
+        logger.warning(f"Long model dir not found: {long_dir}")
+        long_dir = None
+    if not os.path.exists(short_dir):
+        logger.warning(f"Short model dir not found: {short_dir}")
+        short_dir = None
 
-    trader.run_live_trading(interval_seconds=args.interval, dry_run=args.dry_run)
+    trader = LiveEnsembleTrader(long_dir=long_dir, short_dir=short_dir)
+    trader.run(interval_s=args.interval, dry_run=args.dry_run)
+
 
 if __name__ == "__main__":
     main()

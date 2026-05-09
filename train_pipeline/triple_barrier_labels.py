@@ -303,8 +303,139 @@ def time_decay_weights(n: int, decay: float = 0.5) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Events-based 3-outcome labeling
 # ---------------------------------------------------------------------------
+
+def triple_barrier_events(
+    df: pd.DataFrame,
+    pt_atr: float = 2.0,
+    sl_atr: float = 1.0,
+    max_hold: int = 60,
+) -> pd.DataFrame:
+    """3-outcome labeling for event bars using the 'side' column.
+
+    Labels:
+        2 = TP hit first (clean win)
+        0 = SL hit first (clean loss)
+        1 = vertical barrier expired (timeout / ambiguous)
+
+    side column must contain +1 (long) or -1 (short).
+    """
+    required = {"close", "high", "low", "ATR", "side"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing columns: {missing}")
+
+    close = df["close"].values.astype("float64")
+    high = df["high"].values.astype("float64")
+    low = df["low"].values.astype("float64")
+    atr = df["ATR"].values.astype("float64")
+    n = len(df)
+
+    side_arr = df["side"].values.astype("int8")
+    spread_arr = _resolve_spread_series(df).values.astype("float64")
+
+    tb_label = np.zeros(n, dtype="int8")
+    tb_ret = np.zeros(n, dtype="float32")
+    tb_hit = np.full(n, -1, dtype="int32")
+    timeout_return = np.zeros(n, dtype="float32")
+    atr_at_entry = np.zeros(n, dtype="float32")
+    bars_held = np.zeros(n, dtype="int32")
+
+    for i in range(n):
+        s = int(side_arr[i])
+        if s == 0:
+            continue
+        atr_i = atr[i]
+        if np.isnan(atr_i) or atr_i <= 0:
+            continue
+
+        effective_spread = spread_arr[i] + COMMISSION_PIPS
+        half_spread = effective_spread / 2.0
+
+        if s > 0:
+            entry = close[i] + half_spread
+            upper = entry + pt_atr * atr_i
+            lower = entry - sl_atr * atr_i
+        else:
+            entry = close[i] - half_spread
+            upper = entry - pt_atr * atr_i
+            lower = entry + sl_atr * atr_i
+
+        end = min(i + 1 + max_hold, n)
+        hit = -1
+        outcome = 1  # default timeout
+
+        for j in range(i + 1, end):
+            hi_j, lo_j = high[j], low[j]
+
+            if s > 0:
+                if hi_j - half_spread >= upper:
+                    outcome = 2; hit = j; break
+                if lo_j - half_spread <= lower:
+                    outcome = 0; hit = j; break
+            else:
+                if lo_j + half_spread <= upper:
+                    outcome = 2; hit = j; break
+                if hi_j + half_spread >= lower:
+                    outcome = 0; hit = j; break
+
+        if hit == -1:
+            hit = end - 1
+            ret = (close[hit] - entry) / entry * (1 if s > 0 else -1)
+        else:
+            ret = (close[hit] - entry) / entry * (1 if s > 0 else -1)
+
+        tb_label[i] = outcome
+        tb_ret[i] = ret
+        tb_hit[i] = hit
+        timeout_return[i] = float(ret)
+        atr_at_entry[i] = float(atr_i)
+        bars_held[i] = hit - i
+
+    out = df.copy()
+    out["tb_label"] = tb_label
+    out["tb_return"] = tb_ret
+    out["tb_hit_idx"] = tb_hit
+    out["timeout_return"] = timeout_return
+    out["atr_at_entry"] = atr_at_entry
+    out["bars_held"] = bars_held
+    return out
+
+
+def self_healing_label(
+    df: pd.DataFrame,
+    pt_atr: float = 2.0,
+    sl_atr: float = 1.0,
+    max_hold_start: int = 60,
+) -> pd.DataFrame:
+    """Run 3-outcome labeling with self-healing on max_hold.
+
+    If clean_pct < 0.30, reduce max_hold by 10 and re-run.
+    """
+    for mh in range(max_hold_start, 0, -10):
+        labeled = triple_barrier_events(df, pt_atr=pt_atr, sl_atr=sl_atr, max_hold=mh)
+        n_clean = (labeled["tb_label"].isin([0, 2])).sum()
+        n_total = len(labeled)
+        clean_pct = n_clean / max(n_total, 1)
+
+        logger.info(f"  max_hold={mh:>4}  ->  clean_pct={clean_pct:.1%}  "
+                     f"({n_clean}/{n_total} clean)")
+
+        if clean_pct >= 0.30 or mh <= 10:
+            if clean_pct < 0.30:
+                timeout_rows = labeled[labeled["tb_label"] == 1]
+                logger.info(f"Timeout diagnostic ({len(timeout_rows)} events):")
+                logger.info(f"  Median return at timeout: {timeout_rows['timeout_return'].median():.5f}")
+                logger.info(f"  Median ATR at entry:      {timeout_rows['atr_at_entry'].mean():.5f}")
+                logger.info(f"  Median bars held:         {timeout_rows['bars_held'].median():.0f}")
+                logger.info("  Hint: if median return ~ 0 -> market is ranging, tighten ATR filter")
+                logger.info("  Hint: if median ATR is high -> pt_atr/sl_atr may be too wide")
+                logger.info("ABORT: clean_pct never reached 30% — fix primary setup before training")
+                sys.exit(1)
+            return labeled
+
+    return labeled  # unreachable
 
 def main():
     p = argparse.ArgumentParser()
@@ -312,7 +443,7 @@ def main():
     p.add_argument("--out",      default=None,  help="Output CSV path")
     p.add_argument("--pt-atr",   type=float,    default=2.0)
     p.add_argument("--sl-atr",   type=float,    default=1.0)
-    p.add_argument("--max-hold", type=int,       default=30)
+    p.add_argument("--max-hold", type=int,       default=60)
     p.add_argument("--meta",     action="store_true",
                    help="Run meta-labeling (requires --preds column 'primary_pred')")
     p.add_argument("--preds",    default=None,
@@ -321,6 +452,8 @@ def main():
                    help="Commission in price terms. Use 0.00003 for JPY pairs.")
     p.add_argument("--side", type=str, default="long", choices=["long", "short"],
                    help="Direction: long (PT above, SL below) or short (PT below, SL above)")
+    p.add_argument("--events", action="store_true",
+                   help="Events mode: read 'side' column, 3-outcome labels, self-healing, split output")
     args = p.parse_args()
 
     direction = 1 if args.side == "long" else -1
@@ -339,6 +472,40 @@ def main():
         hc = (df["high"] - df["close"].shift()).abs()
         lc = (df["low"]  - df["close"].shift()).abs()
         df["ATR"] = pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(14).mean()
+
+    if args.events:
+        if "side" not in df.columns:
+            sys.exit("--events requires 'side' column from primary_signal_generator.py")
+        logger.info("Events mode: 3-outcome labeling (2=TP, 0=SL, 1=timeout)")
+        labeled = self_healing_label(df, pt_atr=args.pt_atr, sl_atr=args.sl_atr,
+                                     max_hold_start=args.max_hold)
+        base = args.out or args.data.replace(".csv", "")
+        long_df = labeled[labeled["side"] == 1].copy()
+        short_df = labeled[labeled["side"] == -1].copy()
+
+        for side_tag, sdf in [("LONG", long_df), ("SHORT", short_df)]:
+            clean = sdf[sdf["tb_label"].isin([0, 2])]
+            n_clean = len(clean)
+            n_total = len(sdf)
+            wins = (clean["tb_label"] == 2).sum()
+            win_rate = wins / max(n_clean, 1)
+            logger.info(f"{side_tag:5s} | Total: {n_total:>6,} | Clean: {n_clean:>6,} "
+                        f"| Win rate (of clean): {win_rate:.1%}")
+            if n_clean < 100:
+                logger.error(f"{side_tag}: Minimum data (<100 clean events). Abort.")
+                sys.exit(1)
+            if win_rate < 0.35:
+                logger.error(f"{side_tag}: Win rate {win_rate:.1%} < 35%. Primary setup not viable. Abort.")
+                sys.exit(1)
+
+        Path(base).parent.mkdir(parents=True, exist_ok=True)
+        out_l = base + "_events_long_labeled.csv" if base else "events_long_labeled.csv"
+        out_s = base + "_events_short_labeled.csv" if base else "events_short_labeled.csv"
+        long_df.to_csv(out_l, index=False)
+        short_df.to_csv(out_s, index=False)
+        logger.info(f"Saved LONG  -> {out_l}")
+        logger.info(f"Saved SHORT -> {out_s}")
+        return
 
     if args.meta:
         if not args.preds:

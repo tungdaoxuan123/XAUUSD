@@ -1,31 +1,17 @@
 #!/usr/bin/env python3
 """
-train_ensemble_gpu.py - AMD GPU-accelerated 3-Model Ensemble Training Pipeline
+train_ensemble_gpu.py — Meta-Labeling v3 Single Model Trainer
 
-Uses LightGBM with OpenCL backend for AMD GPUs on Windows (RX 6700 XT).
-Falls back to CPU LightGBM cleanly if GPU is unavailable.
-
-GPU Backend Priority:
-    1. LightGBM with device_type='gpu' (OpenCL — works on AMD on Windows)
-    2. LightGBM with device_type='cpu' (CPU fallback)
-    3. sklearn RandomForest (last resort CPU fallback)
-
-Label Encoding Note:
-    LightGBM requires non-negative integer class labels.
-    Our labels (-1, 0, 1) are mapped: -1->0, 0->1, 1->2
-    Probabilities are mapped back to our class scheme for inference.
-
-3-Model Architecture:
-    1. Trend Model     -> LightGBM (directional bias, MACD/VWAP features)
-    2. Structure Model -> LightGBM (nonlinear patterns, different depth/leaves)
-    3. Regime Model    -> LightGBM (volatility/regime detection, ATR/BB features)
+Loads events CSV labeled with 3-outcome triple barriers (tb_label: 2=TP, 0=SL, 1=timeout).
+Drops timeouts, remaps {2:1, 0:0}. Trains one binary LGBM or LogisticRegression model
+with snapshot + velocity + synmicro features. Walk-forward + gain-based feature filter
++ calibration + optimal threshold search.
 
 Usage:
-    python train_pipeline/train_ensemble_gpu.py         --data train_pipeline/data/xauusd_m1.csv         --horizon 5         --buy-threshold 0.0005         --sell-threshold 0.0005         --expanded-features         --use-gpu         --gpu-backend auto         --out-dir train_pipeline/models_gpu
-
-    # CPU fallback (if no GPU available):
-    python train_pipeline/train_ensemble_gpu.py         --data train_pipeline/data/xauusd_m1.csv         --out-dir train_pipeline/models_gpu
+    python train_pipeline/train_ensemble_gpu.py --data train_pipeline/data/events_long_labeled.csv --label-col tb_label --use-gpu --out-dir train_pipeline/models_gpu_long --side long
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -33,7 +19,6 @@ import logging
 import os
 import sys
 import warnings
-from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -41,26 +26,18 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
-# ---------------------------------------------------------------------------
-# Import guard for LightGBM
-# ---------------------------------------------------------------------------
 try:
     import lightgbm as lgb
     LIGHTGBM_AVAILABLE = True
 except ImportError:
     LIGHTGBM_AVAILABLE = False
 
-# Sklearn fallback
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 Path("train_pipeline/reports").mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -72,713 +49,431 @@ logging.basicConfig(
 )
 logger = logging.getLogger("TrainGPU")
 
-# ==========================================================================='
-# LABEL ENCODING (LightGBM requires 0-indexed integer labels)
-# ==========================================================================='
+# ---- Feature definitions ----
+SNAPSHOT_FEATURES = [
+    "rsi_14", "macd_hist", "atr_norm", "ema_ratio",
+    "close_minus_vwap_norm", "bb_position",
+    "candle_body", "upper_wick", "lower_wick",
+    "vol_zscore", "range_vs_atr",
+]
 
-LABEL_MAP = {-1: 0, 0: 1, 1: 2}        # our -> lgb
-LABEL_UNMAP = {0: -1, 1: 0, 2: 1}      # lgb -> our
-LABEL_NAMES = ["SELL", "HOLD", "BUY"]  # lgb class 0, 1, 2
+VELOCITY_FEATURES = [
+    "pullback_speed", "atr_ratio", "vwap_slope_5",
+    "rsi_delta_5", "volume_ratio", "ema_gap", "ema_gap_delta",
+]
+
+MICRO_COLS = [
+    "tick_imbalance", "ofi_window", "cs_spread",
+    "kyle_lambda", "vprof_poc_dist", "amihud",
+    "jump_flag", "regime_flag",
+]
+
+MIN_CONTEXT_BARS = 15
 
 
-def encode_labels(y: pd.Series) -> np.ndarray:
-    return np.array([LABEL_MAP[v] for v in y])
-
-
-# ==========================================================================='
-# GPU DETECTION
-# ==========================================================================='
-
-
-def detect_gpu_backend(requested_backend: str, use_gpu: bool) -> tuple:
-    """Detect available GPU backend. Returns (backend_name, device_type, gpu_active)."""
-    if not use_gpu:
-        logger.info("GPU disabled by CLI flag. Using CPU.")
-        return "cpu", "cpu", False
-
+# ---- GPU Detection ----
+def detect_gpu():
     if not LIGHTGBM_AVAILABLE:
-        logger.warning("LightGBM not installed. Falling back to CPU sklearn.")
-        return "sklearn_cpu", "cpu", False
-
-    # Try LightGBM GPU
-    if requested_backend in ("lightgbm", "auto"):
-        try:
-            probe_data = lgb.Dataset(
-                np.random.randn(100, 5).astype(np.float32),
-                label=np.random.randint(0, 3, 100)
-            )
-            probe_params = {
-                "objective": "multiclass",
-                "num_class": 3,
-                "device_type": "gpu",
-                "verbose": -1,
-                "num_leaves": 4,
-            }
-            lgb.train(probe_params, probe_data, num_boost_round=2)
-            logger.info("LightGBM GPU (OpenCL) detected and working. Using GPU.")
-            return "lightgbm", "gpu", True
-        except Exception as e:
-            logger.warning(f"LightGBM GPU probe failed: {e}")
-            logger.warning("Falling back to LightGBM CPU.")
-            return "lightgbm", "cpu", False
-
-    # XGBoost AMD GPU path (optional)
-    if requested_backend == "xgboost":
-        try:
-            import xgboost as xgb  # noqa: F401
-            logger.warning("XGBoost AMD GPU (ROCm) requested. Verify driver manually.")
-            return "xgboost", "gpu", True
-        except ImportError:
-            logger.error("XGBoost not installed. Install with: pip install xgboost")
-            logger.warning("Falling back to LightGBM CPU.")
-
-    logger.info("No GPU backend active. Running LightGBM on CPU.")
-    return "lightgbm", "cpu", False
+        return "cpu", False
+    try:
+        d = lgb.Dataset(np.random.randn(100, 5).astype(np.float32), label=np.random.randint(0, 2, 100))
+        lgb.train({"objective": "binary", "device_type": "gpu", "verbose": -1, "num_leaves": 4}, d, num_boost_round=2)
+        logger.info("LightGBM GPU (OpenCL) active.")
+        return "gpu", True
+    except Exception as e:
+        logger.warning(f"GPU probe failed: {e}. Using CPU.")
+        return "cpu", False
 
 
-# ==========================================================================='
-# DATA LOADING (reused from train_ensemble.py)
-# ==========================================================================='
+# ---- Feature computation ----
+def compute_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute snapshot + velocity features from OHLCV + indicator data."""
+    close = df["close"].values.astype("float64")
+    high = df["high"].values.astype("float64")
+    low = df["low"].values.astype("float64")
+    open_v = df["open"].values.astype("float64")
+    vol = df["tick_volume"].values.astype("float64") if "tick_volume" in df.columns else np.ones(len(df))
 
-REQUIRED_COLUMNS = {"time", "open", "high", "low", "close", "tick_volume"}
+    atr = df["ATR"].values.astype("float64") if "ATR" in df.columns else np.ones(len(df))
+    rsi = df["RSI"].values.astype("float64") if "RSI" in df.columns else np.full(len(df), 50.0)
+    vwap = df["VWAP"].values.astype("float64") if "VWAP" in df.columns else close
+    macd_h = df["MACD_Hist"].values.astype("float64") if "MACD_Hist" in df.columns else np.zeros(len(df))
+    ema5 = df["EMA5"].values.astype("float64") if "EMA5" in df.columns else close
+    ema20 = df["EMA20"].values.astype("float64") if "EMA20" in df.columns else close
 
-
-def load_data(csv_path: str) -> pd.DataFrame:
-    logger.info(f"Loading data from: {csv_path}")
-    if not os.path.exists(csv_path):
-        logger.error(f"File not found: {csv_path}")
-        sys.exit(1)
-    df = pd.read_csv(csv_path)
-    df.columns = [c.lower().strip() for c in df.columns]
-    missing = REQUIRED_COLUMNS - set(df.columns)
-    if missing:
-        logger.error(f"Missing columns: {missing}")
-        sys.exit(1)
-    df["time"] = pd.to_datetime(df["time"], infer_datetime_format=True)
-    df = df.sort_values("time").reset_index(drop=True)
-    logger.info(f"Loaded {len(df):,} rows | {df['time'].iloc[0]} -> {df['time'].iloc[-1]}")
-    return df
-
-
-# ==========================================================================='
-# TECHNICAL INDICATORS (exact mirror of live_ensemble_trading.py)
-# ==========================================================================='
-
-
-def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Mirror of LiveEnsembleTrader.add_technical_indicators()."""
-    df = df.copy()
-    close = df["close"]
-
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    df["RSI"] = 100 - (100 / (1 + rs))
-
-    exp1 = close.ewm(span=8, adjust=False).mean()
-    exp2 = close.ewm(span=24, adjust=False).mean()
-    df["MACD"] = exp1 - exp2
-    df["Signal_Line"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_Hist"] = df["MACD"] - df["Signal_Line"]
-
-    df["SMA20"] = close.rolling(20).mean()
-    df["STD20"] = close.rolling(20).std()
-    df["Upper_Band"] = df["SMA20"] + df["STD20"] * 2
-    df["Lower_Band"] = df["SMA20"] - df["STD20"] * 2
-    df["BB_width"] = df["Upper_Band"] - df["Lower_Band"]
-
-    low_min = df["low"].rolling(14).min()
-    high_max = df["high"].rolling(14).max()
-    df["%K"] = 100 * ((close - low_min) / (high_max - low_min))
-    df["%D"] = df["%K"].rolling(3).mean()
-
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    vol = df["tick_volume"].replace(0, np.nan).ffill().fillna(1)
-    df["TPV"] = tp * vol
-    df["Cum_TPV"] = df["TPV"].cumsum()
-    df["Cum_Volume"] = vol.cumsum()
-    df["VWAP"] = df["Cum_TPV"] / df["Cum_Volume"].replace(0, np.nan)
-    df["close_minus_vwap"] = close - df["VWAP"]
-
-    hl = df["high"] - df["low"]
-    hc = (df["high"] - close.shift()).abs()
-    lc = (df["low"] - close.shift()).abs()
-    df["ATR"] = pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(14).mean()
-
-    df = df.replace([np.inf, -np.inf], np.nan)
-    # Only drop rows where the indicators we just computed are NaN (first 20-30 bars)
-    # This prevents dropping thousands of bars if microstructure data is partially missing.
-    indicator_cols = ["RSI", "MACD", "Signal_Line", "ATR", "BB_width", "VWAP"]
-    df = df.dropna(subset=[c for c in indicator_cols if c in df.columns]).reset_index(drop=True)
-    return df
-
-
-# ==========================================================================='
-# FEATURES & PROCESSED DATA
-# ==========================================================================='
-
-def get_feature_names(lookback: int, expanded: bool = False, micro: bool = False) -> list:
-    """Generate dynamic feature names based on lookback window."""
-    base = [f"close_lag_{i}" for i in range(lookback - 1, -1, -1)]
-    common = base + ["RSI", "MACD", "Signal_Line", "current_position", "current_balance"]
-    if expanded:
-        common += ["MACD_Hist", "VWAP", "close_minus_vwap", "ATR", "BB_width"]
-    if micro:
-        common += [
-            "tick_imbalance", "bid_ask_vol_imbalance", "spread_mean", "ofi_window", "of_pressure_flag",
-            "vprof_poc_dist", "vprof_in_value_area", "vprof_hvn_flag", "vprof_lvn_flag"
-        ]
-    return common
-
-
-def build_features(df: pd.DataFrame, lookback: int = 10, expanded: bool = False, micro: bool = False) -> pd.DataFrame:
-    """Create feature matrix from indicators with variable price lags."""
-    # List of micro features to extract if present
-    micro_cols = [
-        "tick_imbalance", "bid_ask_vol_imbalance", "spread_mean", "ofi_window", "of_pressure_flag",
-        "vprof_poc_dist", "vprof_in_value_area", "vprof_hvn_flag", "vprof_lvn_flag"
-    ]
-    
-    # Fill NAs for micro features with neutral values (0) so we can still use the full dataset
-    if micro:
-        for col in micro_cols:
-            if col in df.columns:
-                df[col] = df[col].fillna(0)
-            else:
-                logger.warning(f"Micro feature column {col} missing from data!")
-                df[col] = 0.0
-
-    rows = []
-    n = len(df)
-    
-    # We start from lookback-1 to have enough data for the first lag set
-    for i in range(lookback - 1, n):
-        price_lags = df["close"].iloc[i - lookback + 1: i + 1].values
-        latest = df.iloc[i]
-        
-        row = list(price_lags) + [
-            float(latest["RSI"]),
-            float(latest["MACD"]),
-            float(latest["Signal_Line"]),
-            0.0,      # current_position placeholder
-            10000.0,  # current_balance placeholder
-        ]
-        
-        if expanded:
-            row += [
-                float(latest["MACD_Hist"]),
-                float(latest["VWAP"]),
-                float(latest["close_minus_vwap"]),
-                float(latest["ATR"]),
-                float(latest["BB_width"]),
-            ]
-            
-        if micro:
-            for col in micro_cols:
-                row.append(float(latest[col]))
-                
-        rows.append(row)
-
-    cols = get_feature_names(lookback, expanded, micro)
-    return pd.DataFrame(rows, columns=cols)
-
-
-def build_labels(df, lookback=10, horizon=5, buy_threshold=0.0005, sell_threshold=0.0005) -> pd.Series:
-    """Sync labels with the lookback shift in build_features."""
-    close = df["close"].values
-    n = len(close)
-    labels = []
-    
-    # Must match the range(lookback-1, n) loop in build_features
-    for i in range(lookback - 1, n):
-        fi = i + horizon
-        if fi >= n:
-            labels.append(np.nan)
-        else:
-            ret = (close[fi] - close[i]) / close[i]
-            labels.append(1 if ret > buy_threshold else (-1 if ret < -sell_threshold else 0))
-    return pd.Series(labels, name="label")
-
-
-# ==========================================================================='
-# CLASS WEIGHTING FOR IMBALANCED MULTICLASS LABELS
-# ==========================================================================='
-
-
-def compute_sample_weights(y: pd.Series) -> np.ndarray:
-    """Compute per-sample weights inversely proportional to class frequency."""
-    counts = Counter(y.tolist())
-    total = sum(counts.values())
-    num_classes = len(counts)
-    class_weight = {cls: total / (num_classes * cnt) for cls, cnt in counts.items()}
-    logger.info(f"Computed class_weight (orig labels): {class_weight}")
-    return np.array([class_weight[v] for v in y])
-
-
-# ==========================================================================='
-# LIGHTGBM MODEL DEFINITIONS (3 roles)
-# ==========================================================================='
-
-
-def get_lgbm_params(role: str, device_type: str, n_classes: int = 3) -> dict:
-    """Each model has purpose-tuned hyperparameters."""
-    base = {
-        "objective": "multiclass",
-        "num_class": n_classes,
-        "device_type": device_type,
-        "verbose": -1,
-        "random_state": 42,
-    }
-
-    if role == "trend":
-        return {**base,
-            "n_estimators": 500,
-            "num_leaves": 31,
-            "learning_rate": 0.05,
-            "min_child_samples": 20,
-            "reg_alpha": 0.1,
-            "reg_lambda": 0.1,
-        }
-    elif role == "structure":
-        return {**base,
-            "n_estimators": 500,
-            "num_leaves": 63,
-            "learning_rate": 0.03,
-            "min_child_samples": 15,
-            "feature_fraction": 0.8,
-            "bagging_fraction": 0.8,
-            "bagging_freq": 5,
-        }
-    elif role == "regime":
-        return {**base,
-            "n_estimators": 700,
-            "num_leaves": 31,
-            "learning_rate": 0.02,
-            "min_child_samples": 30,
-            "reg_alpha": 0.2,
-            "feature_fraction": 0.7,
-        }
-    return base
-
-
-ENSEMBLE_ROLES = {
-    "trend":     "Trend Model (LightGBM - directional)",
-    "structure": "Structure Model (LightGBM - nonlinear patterns)",
-    "regime":    "Regime Model (LightGBM - volatility/regime)",
-}
-
-
-# ==========================================================================='
-# SKLEARN FALLBACK PIPELINES
-# ==========================================================================='
-
-
-def get_sklearn_fallback(role: str) -> Pipeline:
-    if role == "trend":
-        clf = LogisticRegression(max_iter=2000, class_weight="balanced", C=0.1)
-    elif role == "structure":
-        clf = RandomForestClassifier(
-            n_estimators=300, max_depth=10, class_weight="balanced", n_jobs=-1, random_state=42
-        )
+    # BB
+    if all(c in df.columns for c in ["Upper_Band", "Lower_Band", "BB_width"]):
+        bb_width = df["BB_width"].values.astype("float64")
+        bb_pos = np.clip((close - df["Lower_Band"].values) / (bb_width + 1e-9), 0, 1)
     else:
-        clf = RandomForestClassifier(
-            n_estimators=300, max_depth=8, min_samples_leaf=20,
-            class_weight="balanced", n_jobs=-1, random_state=42
-        )
-    return Pipeline([("scaler", StandardScaler()), ("clf", clf)])
+        sma20 = pd.Series(close).rolling(20).mean().values
+        std20 = pd.Series(close).rolling(20).std().values
+        bb_width = std20 * 4
+        lb = sma20 - std20 * 2
+        bb_pos = np.clip((close - lb) / (bb_width + 1e-9), 0, 1)
+
+    df_out = pd.DataFrame(index=df.index)
+
+    # Snapshot
+    df_out["rsi_14"] = rsi
+    df_out["macd_hist"] = macd_h
+    df_out["atr_norm"] = atr / (close + 1e-9)
+    df_out["ema_ratio"] = ema5 / (ema20 + 1e-9)
+    df_out["close_minus_vwap_norm"] = (close - vwap) / (atr + 1e-9)
+    df_out["bb_position"] = bb_pos
+    df_out["candle_body"] = (close - open_v) / (atr + 1e-9)
+    df_out["upper_wick"] = (high - np.maximum(open_v, close)) / (atr + 1e-9)
+    df_out["lower_wick"] = (np.minimum(open_v, close) - low) / (atr + 1e-9)
+    df_out["vol_zscore"] = (atr - pd.Series(atr).rolling(100, min_periods=10).mean().values) / (pd.Series(atr).rolling(100, min_periods=10).std().values + 1e-9)
+    df_out["range_vs_atr"] = (high - low) / (atr + 1e-9)
+
+    # Velocity
+    n = len(df)
+    for i in range(n):
+        if i < MIN_CONTEXT_BARS:
+            df_out.loc[i, "pullback_speed"] = 0.0
+            df_out.loc[i, "atr_ratio"] = 1.0
+            df_out.loc[i, "vwap_slope_5"] = 0.0
+            df_out.loc[i, "rsi_delta_5"] = 0.0
+            df_out.loc[i, "volume_ratio"] = 1.0
+            df_out.loc[i, "ema_gap"] = 0.0
+            df_out.loc[i, "ema_gap_delta"] = 0.0
+            continue
+
+        df_out.loc[i, "pullback_speed"] = (close[i] - close[i - 5]) / (atr[i] * 5 + 1e-9)
+        df_out.loc[i, "atr_ratio"] = atr[i] / (atr[i - 10] + 1e-9)
+        df_out.loc[i, "vwap_slope_5"] = (vwap[i] - vwap[i - 5]) / (atr[i] + 1e-9)
+        df_out.loc[i, "rsi_delta_5"] = rsi[i] - rsi[i - 5]
+        df_out.loc[i, "volume_ratio"] = vol[i] / (np.mean(vol[max(0, i - 5):i]) + 1e-9)
+        df_out.loc[i, "ema_gap"] = (ema5[i] - ema20[i]) / (atr[i] + 1e-9)
+        df_out.loc[i, "ema_gap_delta"] = df_out.loc[i, "ema_gap"] - ((ema5[i - 5] - ema20[i - 5]) / (atr[i - 5] + 1e-9))
+
+    df_out = df_out.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    # Synmicro
+    for col in MICRO_COLS:
+        df_out[col] = df[col].values.astype("float64") if col in df.columns else 0.0
+
+    return df_out
 
 
-# ==========================================================================='
-# WALK-FORWARD TRAINING
-# ==========================================================================='
+def get_feature_list(df_out: pd.DataFrame) -> list:
+    feats = SNAPSHOT_FEATURES + VELOCITY_FEATURES
+    return [f for f in feats if f in df_out.columns] + [c for c in MICRO_COLS if c in df_out.columns]
 
 
-def walk_forward_lgbm(
-    X: pd.DataFrame, y: pd.Series, role: str, device_type: str, n_splits: int = 5
-) -> tuple:
-    """Walk-forward training for LightGBM. Returns (fitted_model, summary)."""
-    label = ENSEMBLE_ROLES[role]
-    logger.info(f"\n{'='*65}\n  Training [{role}]: {label} | device={device_type}\n{'='*65}")
+# ---- Training ----
+def train_model(
+    X: pd.DataFrame, y: pd.Series, device_type: str, use_gpu: bool, side: str
+):
+    n_clean = len(X)
+    logger.info(f"Training on {n_clean:,} clean events | side={side}")
+    logger.info(f"Features ({len(X.columns)}): {list(X.columns)}")
 
-    tscv = TimeSeriesSplit(n_splits=n_splits)
+    if n_clean >= 500 and LIGHTGBM_AVAILABLE:
+        logger.info("N >= 500 -> LightGBM")
+        model, feat_importance, fold_metrics = _train_lgbm(X, y, device_type, use_gpu)
+        backend = "lightgbm"
+    else:
+        logger.warning(f"N={n_clean} < 500 -> LogisticRegression")
+        model, feat_importance, fold_metrics = _train_logreg(X, y)
+        backend = "sklearn"
+
+    return model, feat_importance, fold_metrics, backend
+
+
+def _train_lgbm(X: pd.DataFrame, y: pd.Series, device_type: str, use_gpu: bool):
+    feats = list(X.columns)
+    y_enc = y.values.astype(int)
+    tscv = TimeSeriesSplit(n_splits=5)
     fold_metrics = []
-    last_model = None
-    y_enc = encode_labels(y)
+    importance_sums = np.zeros(len(feats))
 
-    for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
-        X_train = X.iloc[train_idx].astype(np.float32).values
-        X_val   = X.iloc[val_idx].astype(np.float32).values
-        y_train_enc, y_val_enc = y_enc[train_idx], y_enc[val_idx]
+    for fold, (tr, va) in enumerate(tscv.split(X)):
+        X_tr = X.iloc[tr].astype(np.float32).values
+        X_va = X.iloc[va].astype(np.float32).values
+        y_tr = y_enc[tr]
+        y_va = y_enc[va]
 
-        # weights based on original labels
-        y_train_orig = y.iloc[train_idx].reset_index(drop=True)
-        sample_weight = compute_sample_weights(y_train_orig)
+        n_neg = (y_tr == 0).sum()
+        n_pos = max((y_tr == 1).sum(), 1)
+        scale_pos_weight = n_neg / n_pos
 
-        params = get_lgbm_params(role, device_type)
-        n_est = params.pop("n_estimators", 500)
+        params = {
+            "objective": "binary",
+            "device_type": device_type,
+            "verbose": -1,
+            "random_state": 42,
+            "max_bin": 63,
+            "num_leaves": 15,
+            "max_depth": 4,
+            "min_child_samples": 100,
+            "n_estimators": 200,
+            "subsample": 0.7,
+            "colsample_bytree": 0.7,
+            "lambda_l1": 1.0,
+            "lambda_l2": 1.0,
+            "scale_pos_weight": scale_pos_weight,
+            "learning_rate": 0.05,
+        }
 
-        train_data = lgb.Dataset(X_train, label=y_train_enc, weight=sample_weight)
-        val_data = lgb.Dataset(X_val, label=y_val_enc, reference=train_data)
+        train_ds = lgb.Dataset(X_tr, label=y_tr)
+        val_ds = lgb.Dataset(X_va, label=y_va, reference=train_ds)
 
         model = lgb.train(
-            params,
-            train_data,
-            num_boost_round=n_est,
-            valid_sets=[val_data],
-            callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)],
+            params, train_ds, num_boost_round=200,
+            valid_sets=[val_ds],
+            callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
         )
 
-        proba = model.predict(X_val)  # shape (n_val, 3)
-        if proba.ndim == 1:
-            proba = proba.reshape(-1, 3)
-        y_pred_enc = np.argmax(proba, axis=1)
-        y_pred = np.array([LABEL_UNMAP[c] for c in y_pred_enc])
-        y_val_orig = np.array([LABEL_UNMAP[c] for c in y_val_enc])
+        p = model.predict(X_va)
+        y_pred = (p >= 0.5).astype(int)
+        acc = accuracy_score(y_va, y_pred)
+        f1 = f1_score(y_va, y_pred, average="binary", zero_division=0)
+        logger.info(f"  Fold {fold+1}/5 | Acc: {acc:.4f} | F1: {f1:.4f} | N_pos: {y_tr.sum()}/{len(y_tr)}")
+        fold_metrics.append({"fold": fold + 1, "accuracy": acc, "binary_f1": f1})
 
-        acc = accuracy_score(y_val_orig, y_pred)
-        f1 = f1_score(y_val_orig, y_pred, average="macro", zero_division=0)
-        cm = confusion_matrix(y_val_orig, y_pred, labels=[-1, 0, 1])
-        report = classification_report(
-            y_val_orig, y_pred, labels=[-1, 0, 1],
-            target_names=["SELL", "HOLD", "BUY"], zero_division=0
-        )
+        imp = model.feature_importance(importance_type="gain")
+        if len(imp) == len(feats):
+            importance_sums += imp / max(imp.sum(), 1)
 
-        logger.info(
-            f"\n  [{role}] Fold {fold + 1}/{n_splits} | "
-            f"Train: {len(X_train):,}  Val: {len(X_val):,}\n"
-            f"  Accuracy: {acc:.4f}  Macro F1: {f1:.4f}\n"
-            f"  Confusion Matrix:\n{cm}\n{report}"
-        )
+    mean_imp = importance_sums / 5
+    imp_df = pd.DataFrame({"feature": feats, "importance": mean_imp}).sort_values("importance", ascending=False)
+    logger.info(f"Feature importance:\n{imp_df.to_string()}")
 
-        fold_metrics.append({"fold": fold + 1, "accuracy": acc, "macro_f1": f1})
-        last_model = model
+    # Filter: keep features where mean importance > 0.001 * max
+    threshold = 0.001 * max(mean_imp.max(), 1e-9)
+    survivors = [feats[i] for i in range(len(feats)) if mean_imp[i] > threshold]
+    logger.info(f"Surviving features after gain filter ({len(survivors)}/{len(feats)}): {survivors}")
 
-    acc_mean = np.mean([m["accuracy"] for m in fold_metrics])
-    f1_mean = np.mean([m["macro_f1"] for m in fold_metrics])
-    logger.info(f"  [{role}] AGGREGATE -> Mean Acc: {acc_mean:.4f} | Mean F1: {f1_mean:.4f}")
+    # Retrain on full data with survivors
+    if len(survivors) > 0:
+        X_surv = X[survivors].astype(np.float32).values
+    else:
+        logger.warning("No features survived gain filter — using all features")
+        X_surv = X.astype(np.float32).values
+        survivors = feats
 
-    summary = {
-        "model": role,
-        "label": label,
-        "backend": "lightgbm",
-        "device_type": device_type,
-        "micro": any("tick" in str(f) for f in X.columns),
-        "n_splits": n_splits,
-        "mean_accuracy": acc_mean,
-        "mean_macro_f1": f1_mean,
-        "fold_detail": fold_metrics,
-    }
-    return last_model, summary
+    n_neg_f = (y_enc == 0).sum()
+    n_pos_f = max((y_enc == 1).sum(), 1)
+    params["scale_pos_weight"] = n_neg_f / n_pos_f
+
+    full_ds = lgb.Dataset(X_surv, label=y_enc)
+    full_model = lgb.train(params, full_ds, num_boost_round=200)
+
+    return full_model, survivors, fold_metrics
 
 
-def walk_forward_sklearn(
-    X: pd.DataFrame, y: pd.Series, role: str, n_splits: int = 5
-) -> tuple:
-    """Walk-forward training for sklearn fallback. Returns (fitted_pipeline, summary)."""
-    logger.info(f"\n  [{role}] Using sklearn CPU fallback")
-    tscv = TimeSeriesSplit(n_splits=n_splits)
+def _train_logreg(X: pd.DataFrame, y: pd.Series):
+    feats = list(X.columns)
+    y_enc = y.values.astype(int)
+    tscv = TimeSeriesSplit(n_splits=min(5, max(2, len(X) // 50)))
     fold_metrics = []
-    last_pipeline = None
 
-    for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
-        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+    for fold, (tr, va) in enumerate(tscv.split(X)):
+        X_tr, X_va = X.iloc[tr], X.iloc[va]
+        y_tr, y_va = y_enc[tr], y_enc[va]
 
-        pipeline = get_sklearn_fallback(role)
-        pipeline.fit(X_train, y_train)
-        y_pred = pipeline.predict(X_val)
+        pipe = Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(C=0.1, class_weight="balanced", max_iter=2000, random_state=42)),
+        ])
+        pipe.fit(X_tr, y_tr)
+        y_pred = pipe.predict(X_va)
+        acc = accuracy_score(y_va, y_pred)
+        f1 = f1_score(y_va, y_pred, average="binary", zero_division=0)
+        logger.info(f"  Fold {fold+1} | Acc: {acc:.4f} | F1: {f1:.4f}")
+        fold_metrics.append({"fold": fold + 1, "accuracy": acc, "binary_f1": f1})
 
-        acc = accuracy_score(y_val, y_pred)
-        f1 = f1_score(y_val, y_pred, average="macro", zero_division=0)
-        logger.info(f"  [{role}] Fold {fold+1} | Acc: {acc:.4f} | F1: {f1:.4f}")
-        fold_metrics.append({"fold": fold + 1, "accuracy": acc, "macro_f1": f1})
-        last_pipeline = pipeline
-
-    summary = {
-        "model": role,
-        "backend": "sklearn_cpu",
-        "n_splits": n_splits,
-        "mean_accuracy": np.mean([m["accuracy"] for m in fold_metrics]),
-        "mean_macro_f1": np.mean([m["macro_f1"] for m in fold_metrics]),
-        "fold_detail": fold_metrics,
-    }
-    return last_pipeline, summary
+    # Retrain on full
+    pipe = Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", LogisticRegression(C=0.1, class_weight="balanced", max_iter=2000, random_state=42)),
+    ])
+    pipe.fit(X, y_enc)
+    return pipe, feats, fold_metrics
 
 
-# ==========================================================================='
-# SAVE ARTIFACTS
-# ==========================================================================='
+# ---- Calibration ----
+def calibrate_and_threshold(model, X_calib: np.ndarray, y_calib: np.ndarray,
+                            fold_metrics: list, side: str, backend: str):
+    """Calibrate model on holdout and find optimal threshold."""
+    from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+
+    n = len(y_calib)
+    p_raw = _predict_proba(model, X_calib, backend)
+
+    if n >= 200:
+        cal = CalibratedClassifierCV(estimator=None, method="isotonic", cv="prefit")
+        cal_method = "isotonic"
+    else:
+        cal = CalibratedClassifierCV(estimator=None, method="sigmoid", cv="prefit")
+        cal_method = "sigmoid"
+        logger.warning(f"Holdout N={n} < 200 -> using Platt Scaling (sigmoid)")
+
+    # Wrap raw model to calibrate
+    class _Wrapper:
+        def __init__(self, pred_fn, backend):
+            self.pred_fn = pred_fn
+            self.backend = backend
+        def fit(self, X, y): pass
+        def predict_proba(self, X):
+            p = self.pred_fn(X)
+            return np.column_stack([1 - p, p])
+
+    wrapper = _Wrapper(lambda x: _predict_proba(model, x, backend), backend)
+    wrapper.fit(X_calib, y_calib)
+    cal.fit(X_calib, y_calib)
+    p_cal = cal.predict_proba(X_calib)[:, 1]
+
+    # Log calibration curve
+    try:
+        frac_pos, mean_pred = calibration_curve(y_calib, p_cal, n_bins=10)
+        logger.info(f"Calibration curve ({cal_method}):")
+        for mp, fp in zip(mean_pred, frac_pos):
+            logger.info(f"  Model says {mp:.2f} -> Actual win rate {fp:.2f}")
+    except Exception as e:
+        logger.warning(f"Calibration curve failed: {e}")
+
+    # Find optimal threshold
+    best_t, best_exp, best_wr, best_n = 0.5, -999, 0, 0
+    for t in np.arange(0.40, 0.81, 0.01):
+        preds = (p_cal >= t).astype(int)
+        n_trades = preds.sum()
+        if n_trades < 10:
+            continue
+        wins = preds[y_calib == 1].sum() if preds.sum() > 0 else 0
+        wr = wins / max(preds.sum(), 1)
+        expectancy = wr * 2 - (1 - wr) * 1
+        if expectancy > best_exp and n_trades >= 10:
+            best_exp = expectancy
+            best_t = t
+            best_wr = wr
+            best_n = n_trades
+
+    logger.info(f"Optimal threshold: {best_t:.2f} | Expectancy: {best_exp:.3f}R | "
+                f"Win rate: {best_wr:.1%} | N trades: {best_n}")
+
+    return cal, cal_method, best_t, best_exp
 
 
-def save_lgbm_model(
-    model,
-    feature_names: list,
-    summary: dict,
-    role: str,
-    out_dir: str,
-    expanded: bool,
-    horizon: int,
-    buy_thr: float,
-    sell_thr: float,
-    device_type: str,
-    lookback: int,
-):
+def _predict_proba(model, X, backend: str) -> np.ndarray:
+    if backend == "lightgbm":
+        p = model.predict(X.astype(np.float32))
+        return p if p.ndim == 1 else p[:, 1]
+    else:
+        return model.predict_proba(X)[:, 1]
+
+
+# ---- Save ----
+def save_artifacts(model, calibrator, features, fold_metrics, args, backend, side,
+                   best_threshold, best_expectancy):
+    out_dir = args.out_dir
     os.makedirs(out_dir, exist_ok=True)
-    suffix = "expanded" if expanded else "default"
-    tag = f"{role}_{suffix}"
 
-    model_path = os.path.join(out_dir, f"lgbm_{tag}.txt")
-    features_path = os.path.join(out_dir, f"features_{tag}.json")
-    summary_path = os.path.join(out_dir, f"summary_{tag}.json")
+    # Model
+    if backend == "lightgbm":
+        mpath = os.path.join(out_dir, "model.txt")
+        model.save_model(mpath)
+    else:
+        import joblib
+        mpath = os.path.join(out_dir, "model.joblib")
+        joblib.dump(model, mpath)
 
-    model.save_model(model_path)
-
-    with open(features_path, "w") as f:
-        json.dump(
-            {
-                "feature_names": feature_names,
-                "feature_count": len(feature_names),
-                "lookback": lookback,
-                "expanded_features": expanded,
-                "microstructure_features": summary.get("micro", False),
-                "label_horizon": horizon,
-                "buy_threshold": buy_thr,
-                "sell_threshold": sell_thr,
-                "label_map": LABEL_MAP,
-                "label_unmap": {str(k): v for k, v in LABEL_UNMAP.items()},
-                "backend": "lightgbm",
-                "device_type": device_type,
-            },
-            f,
-            indent=2,
-        )
-
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2, default=str)
-
-    logger.info(f"  Saved model    : {model_path}")
-    logger.info(f"  Saved features : {features_path}")
-    logger.info(f"  Saved summary  : {summary_path}")
-    return model_path
-
-
-def save_sklearn_model(
-    pipeline,
-    feature_names: list,
-    summary: dict,
-    role: str,
-    out_dir: str,
-    expanded: bool,
-    horizon: int,
-    buy_thr: float,
-    sell_thr: float,
-    lookback: int,
-):
+    # Calibrator
     import joblib
+    cpath = os.path.join(out_dir, f"calibrator_{side}.pkl")
+    joblib.dump(calibrator, cpath)
 
-    os.makedirs(out_dir, exist_ok=True)
-    suffix = "expanded" if expanded else "default"
-    tag = f"{role}_{suffix}"
+    # Metadata
+    meta = {
+        "backend": backend,
+        "side": side,
+        "features": features,
+        "n_features": len(features),
+        "label_horizon": args.max_hold,
+        "pt_atr": 2.0,
+        "sl_atr": 1.0,
+        "threshold": best_threshold,
+        "expectancy": best_expectancy,
+        "fold_metrics": fold_metrics,
+    }
+    with open(os.path.join(out_dir, "ensemble_metadata.json"), "w") as f:
+        json.dump(meta, f, indent=2)
 
-    model_path = os.path.join(out_dir, f"sklearn_{role}_{suffix}.joblib")
-    joblib.dump(pipeline, model_path)
-
-    features_path = os.path.join(out_dir, f"features_{tag}.json")
-    with open(features_path, "w") as f:
-        json.dump(
-            {
-                "feature_names": feature_names,
-                "feature_count": len(feature_names),
-                "lookback": lookback,
-                "expanded_features": expanded,
-                "microstructure_features": summary.get("micro", False),
-                "label_horizon": horizon,
-                "buy_threshold": buy_thr,
-                "sell_threshold": sell_thr,
-                "backend": "sklearn_cpu",
-            },
-            f,
-            indent=2,
-        )
-
-    summary_path = os.path.join(out_dir, f"summary_{tag}.json")
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2, default=str)
-
-    logger.info(f"  Saved sklearn fallback : {model_path}")
-    return model_path
+    logger.info(f"Saved model -> {mpath}")
+    logger.info(f"Saved calibrator -> {cpath}")
+    logger.info(f"Saved metadata -> {out_dir}/ensemble_metadata.json")
 
 
-def save_ensemble_metadata(
-    out_dir: str,
-    model_paths: dict,
-    feature_names: list,
-    expanded: bool,
-    gpu_active: bool,
-    backend: str,
-    horizon: int,
-    buy_thr: float,
-    sell_thr: float,
-    lookback: int,
-):
-    meta_path = os.path.join(out_dir, "ensemble_metadata.json")
-    with open(meta_path, "w") as f:
-        json.dump(
-            {
-                "backend": backend,
-                "gpu_used": gpu_active,
-                "model_files": model_paths,
-                "model_names": list(model_paths.keys()),
-                "feature_names": feature_names,
-                "feature_count": len(feature_names),
-                "lookback": lookback,
-                "expanded_features": expanded,
-                "microstructure_features": "micro" in out_dir.lower() or any("vprof" in f for f in feature_names),
-                "label_horizon": horizon,
-                "buy_threshold": buy_thr,
-                "sell_threshold": sell_thr,
-                "label_map": LABEL_MAP,
-            },
-            f,
-            indent=2,
-        )
-    logger.info(f"Ensemble metadata saved: {meta_path}")
-
-
-# ==========================================================================='
-# CLI
-# ==========================================================================='
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="AMD GPU 3-Model Ensemble Training — LightGBM OpenCL with CPU fallback"
-    )
-    parser.add_argument("--data",              required=True)
-    parser.add_argument("--horizon",           type=int,   default=5)
-    parser.add_argument("--lookback",          type=int,   default=10)
-    parser.add_argument("--buy-threshold",     type=float, default=0.0005)
-    parser.add_argument("--sell-threshold",    type=float, default=0.0005)
-    parser.add_argument("--expanded-features", action="store_true")
-    parser.add_argument("--microstructure-features", action="store_true", help="Include microstructure columns if present in data")
-    parser.add_argument("--use-gpu",           action="store_true")
-    parser.add_argument(
-        "--gpu-backend", type=str, default="auto", choices=["lightgbm", "xgboost", "auto"]
-    )
-    parser.add_argument("--n-splits",          type=int,   default=5)
-    parser.add_argument("--out-dir",           type=str,   default="train_pipeline/models_gpu")
-    return parser.parse_args()
-
-
+# ---- CLI ----
 def main():
-    args = parse_args()
-    suffix = "expanded" if args.expanded_features else "default"
+    ap = argparse.ArgumentParser(description="Meta-Labeling v3 Single Model Trainer")
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--label-col", type=str, default="tb_label")
+    ap.add_argument("--use-gpu", action="store_true")
+    ap.add_argument("--out-dir", type=str, default="train_pipeline/models_gpu")
+    ap.add_argument("--side", type=str, default="long", choices=["long", "short"])
+    ap.add_argument("--max-hold", type=int, default=60)
+    ap.add_argument("--expanded-features", action="store_true")  # ignored, kept for compat
+    ap.add_argument("--microstructure-features", action="store_true")  # ignored
+    args = ap.parse_args()
 
     logger.info("=" * 65)
-    logger.info("  XAUUSD GPU Ensemble Training (LightGBM + AMD OpenCL)")
-    logger.info("=" * 65)
-    logger.info(f"  Data          : {args.data}")
-    logger.info(f"  Horizon       : {args.horizon} bars")
-    logger.info(f"  Lookback      : {args.lookback} bars")
-    logger.info(f"  Buy threshold : {args.buy_threshold:.4%}")
-    logger.info(f"  Sell threshold: {args.sell_threshold:.4%}")
-    logger.info(f"  Features      : {suffix}")
-    logger.info(f"  GPU requested : {args.use_gpu}")
-    logger.info(f"  GPU backend   : {args.gpu_backend}")
-    logger.info(f"  Folds         : {args.n_splits}")
-    logger.info(f"  Output dir    : {args.out_dir}")
+    logger.info(f"  Meta-Labeling v3 Training | side={args.side}")
+    logger.info(f"  Data: {args.data}")
+    logger.info(f"  Output: {args.out_dir}")
     logger.info("=" * 65)
 
-    # Detect GPU
-    backend, device_type, gpu_active = detect_gpu_backend(args.gpu_backend, args.use_gpu)
-    logger.info(f"GPU active: {gpu_active} | Backend: {backend} | Device: {device_type}")
+    device_type, gpu_active = detect_gpu() if args.use_gpu else ("cpu", False)
 
-    # Load & process data
-    df_raw = load_data(args.data)
-    logger.info("Computing technical indicators...")
-    df = add_technical_indicators(df_raw)
-    logger.info(f"After indicators: {len(df):,} rows")
+    df = pd.read_csv(args.data)
+    df.columns = [c.lower().strip() for c in df.columns]
+    logger.info(f"Loaded {len(df):,} rows")
 
-    logger.info("Building feature matrix...")
-    X = build_features(df, lookback=args.lookback, expanded=args.expanded_features, micro=args.microstructure_features)
-    feature_names = list(X.columns)
-    logger.info(f"Features: {len(feature_names)} | {feature_names[:15]}...")
+    if args.label_col not in df.columns:
+        logger.error(f"Label column '{args.label_col}' not found. Columns: {list(df.columns)[:20]}")
+        sys.exit(1)
 
-    logger.info("Building labels...")
-    y = build_labels(df, lookback=args.lookback, horizon=args.horizon, buy_threshold=args.buy_threshold, sell_threshold=args.sell_threshold)
-    
-    valid_mask = y.notna()
-    X = X[valid_mask].reset_index(drop=True)
-    y = y[valid_mask].reset_index(drop=True).astype(int)
-    logger.info(f"Dataset: {len(X):,} rows | Labels: {y.value_counts().sort_index().to_dict()}")
+    # Drop timeouts (tb_label == 1), remap {2:1, 0:0}
+    timeout_count = (df[args.label_col] == 1).sum()
+    df = df[df[args.label_col] != 1].copy()
+    df[args.label_col] = df[args.label_col].map({2: 1, 0: 0})
+    logger.info(f"Training on {len(df):,} clean events (timeouts dropped: {timeout_count:,})")
+    logger.info(f"Label dist: {df[args.label_col].value_counts().sort_index().to_dict()}")
 
-    # Train all 3 models
-    model_paths = {}
-    for role in ["trend", "structure", "regime"]:
-        if backend == "lightgbm" and LIGHTGBM_AVAILABLE:
-            model, summary = walk_forward_lgbm(X, y, role, device_type, args.n_splits)
-            logger.info(f"\nRefitting [{role}] on full dataset...")
-            y_enc = encode_labels(y)
-            full_weight = compute_sample_weights(y)
-            params = get_lgbm_params(role, device_type)
-            n_est = params.pop("n_estimators", 500)
-            full_data = lgb.Dataset(X.astype(np.float32).values, label=y_enc, weight=full_weight)
-            model = lgb.train(params, full_data, num_boost_round=n_est)
-            path = save_lgbm_model(
-                model,
-                feature_names,
-                summary,
-                role,
-                args.out_dir,
-                args.expanded_features,
-                args.horizon,
-                args.buy_threshold,
-                args.sell_threshold,
-                device_type,
-                args.lookback,
-            )
-        else:
-            pipeline, summary = walk_forward_sklearn(X, y, role, args.n_splits)
-            pipeline.fit(X, y)
-            path = save_sklearn_model(
-                pipeline,
-                feature_names,
-                summary,
-                role,
-                args.out_dir,
-                args.expanded_features,
-                args.horizon,
-                args.buy_threshold,
-                args.sell_threshold,
-                args.lookback,
-            )
+    # Quality gate
+    if len(df) < 100:
+        logger.error(f"Only {len(df)} clean events — minimum 100 required. Abort.")
+        sys.exit(1)
 
-        model_paths[role] = path
+    # Compute features
+    logger.info("Computing features...")
+    X = compute_features(df)
+    feats = get_feature_list(X)
+    X = X[feats]
+    y = df[args.label_col].reset_index(drop=True).astype(int)
 
-    # Save ensemble metadata
-    save_ensemble_metadata(
-        args.out_dir,
-        model_paths,
-        feature_names,
-        args.expanded_features,
-        gpu_active,
-        backend,
-        args.horizon,
-        args.buy_threshold,
-        args.sell_threshold,
-        args.lookback,
+    # Train
+    model, feat_importance, fold_metrics, backend = train_model(X, y, device_type, gpu_active, args.side)
+
+    # Calibration on last 20% of data (or full data if too small)
+    n_calib = max(int(len(X) * 0.2), 50)
+    n_calib = min(n_calib, len(X) - 50)
+    X_calib_np = X.iloc[-n_calib:].values
+    y_calib_np = y.iloc[-n_calib:].values
+
+    calibrator, cal_method, best_t, best_exp = calibrate_and_threshold(
+        model, X_calib_np, y_calib_np, fold_metrics, args.side, backend,
     )
 
-    logger.info("\n" + "=" * 65)
-    logger.info("  ALL 3 MODELS TRAINED AND SAVED")
-    logger.info("=" * 65)
-    for role, path in model_paths.items():
-        logger.info(f"  {role:12s} -> {path}")
-    logger.info("\nLoad in live bot:")
-    logger.info("  from train_pipeline.ensemble_gpu import EnsembleGPU")
-    logger.info(f"  ens = EnsembleGPU.load('{args.out_dir}')")
-    logger.info("=" * 65)
+    # Save
+    save_artifacts(
+        model, calibrator, feat_importance, fold_metrics,
+        args, backend, args.side, best_t, best_exp,
+    )
+
+    logger.info("Done.")
 
 
 if __name__ == "__main__":
