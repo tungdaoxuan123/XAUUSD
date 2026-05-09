@@ -83,7 +83,7 @@ def detect_gpu():
 
 
 # ---- Feature computation ----
-def compute_features(df: pd.DataFrame, zscore_window: int = 500) -> pd.DataFrame:
+def compute_features(df: pd.DataFrame, zscore_window: int = 500, lookback: int = 0) -> pd.DataFrame:
     """Compute snapshot + velocity features from OHLCV + indicator data."""
     close = df["close"].values.astype("float64")
     high = df["high"].values.astype("float64")
@@ -119,6 +119,10 @@ def compute_features(df: pd.DataFrame, zscore_window: int = 500) -> pd.DataFrame
     df_out["lower_wick"] = (np.minimum(open_v, close) - low) / (atr + 1e-9)
     df_out["range_vs_atr"] = (high - low) / (atr + 1e-9)
 
+    # EMA200 regime feature
+    ema200 = pd.Series(close).ewm(span=200, adjust=False).mean().values
+    df_out["above_ema200"] = (close > ema200).astype("float64")
+
     # Velocity (active only)
     n = len(df)
     for i in range(n):
@@ -150,18 +154,30 @@ def compute_features(df: pd.DataFrame, zscore_window: int = 500) -> pd.DataFrame
         df_out[col] = np.clip((raw - rm) / (rs + 1e-9), -4, 4)
         df_out[col] = np.nan_to_num(df_out[col], nan=0.0)
 
+    # Return lag features (ATR-normalized)
+    if lookback > 0:
+        for k in range(lookback):
+            col = f"return_lag_{k}"
+            df_out[col] = np.clip(
+                (close - np.roll(close, k + 1)) / (np.roll(atr, k + 1) + 1e-9), -10, 10
+            )
+            # First k+1 bars are NaN -> fill with 0
+            df_out[col] = np.nan_to_num(df_out[col], nan=0.0)
+
     return df_out
 
 
-def get_feature_list(df_out: pd.DataFrame) -> list:
-    feats = SNAPSHOT_FEATURES + VELOCITY_FEATURES
+def get_feature_list(df_out: pd.DataFrame, lookback: int = 0) -> list:
+    feats = SNAPSHOT_FEATURES + VELOCITY_FEATURES + ["above_ema200"]
+    if lookback > 0:
+        feats += [f"return_lag_{k}" for k in range(lookback)]
     return [f for f in feats if f in df_out.columns] + [c for c in MICRO_COLS if c in df_out.columns]
 
 
 # ---- Training ----
 def train_model(
     X: pd.DataFrame, y: pd.Series, device_type: str, use_gpu: bool, side: str,
-    skip_filter: bool = False,
+    skip_filter: bool = False, recency_weight: bool = False,
 ):
     n_clean = len(X)
     logger.info(f"Training on {n_clean:,} clean events | side={side}")
@@ -169,7 +185,7 @@ def train_model(
 
     if n_clean >= 500 and LIGHTGBM_AVAILABLE:
         logger.info("N >= 500 -> LightGBM")
-        model, feat_importance, fold_metrics = _train_lgbm(X, y, device_type, use_gpu, skip_filter)
+        model, feat_importance, fold_metrics = _train_lgbm(X, y, device_type, use_gpu, skip_filter, recency_weight)
         backend = "lightgbm"
     else:
         logger.warning(f"N={n_clean} < 500 -> LogisticRegression")
@@ -180,7 +196,7 @@ def train_model(
 
 
 def _train_lgbm(X: pd.DataFrame, y: pd.Series, device_type: str, use_gpu: bool,
-                 skip_filter: bool = False):
+                 skip_filter: bool = False, recency_weight: bool = False):
     feats = list(X.columns)
     y_enc = y.values.astype(int)
 
@@ -192,6 +208,13 @@ def _train_lgbm(X: pd.DataFrame, y: pd.Series, device_type: str, use_gpu: bool,
     y_va = y_enc[cut:]
 
     logger.info(f"Time-split: train={len(X_tr):,} (first 70%) | val={len(X_va):,} (last 30%)")
+
+    # Recency weighting: exponential decay, recent samples get higher weight
+    if recency_weight:
+        recency = np.exp(np.linspace(0, 1, len(y_tr)))
+        logger.info(f"Recency weighting ON — weight range: [{recency[0]:.2f}, {recency[-1]:.2f}]")
+    else:
+        recency = None
 
     n_neg = (y_tr == 0).sum()
     n_pos = max((y_tr == 1).sum(), 1)
@@ -215,7 +238,7 @@ def _train_lgbm(X: pd.DataFrame, y: pd.Series, device_type: str, use_gpu: bool,
         "learning_rate": 0.02,
     }
 
-    train_ds = lgb.Dataset(X_tr, label=y_tr)
+    train_ds = lgb.Dataset(X_tr, label=y_tr, weight=recency)
     val_ds = lgb.Dataset(X_va, label=y_va, reference=train_ds)
 
     model = lgb.train(
@@ -257,7 +280,8 @@ def _train_lgbm(X: pd.DataFrame, y: pd.Series, device_type: str, use_gpu: bool,
     n_pos_f = max((y_enc == 1).sum(), 1)
     params["scale_pos_weight"] = min(n_neg_f / n_pos_f, 3.0)
 
-    full_ds = lgb.Dataset(X_surv, label=y_enc)
+    full_recency = np.exp(np.linspace(0, 1, len(y_enc))) if recency_weight else None
+    full_ds = lgb.Dataset(X_surv, label=y_enc, weight=full_recency)
     full_model = lgb.train(params, full_ds, num_boost_round=500)
 
     return full_model, survivors, fold_metrics
@@ -387,7 +411,6 @@ def save_artifacts(model, calibrator, features, fold_metrics, args, backend, sid
     out_dir = args.out_dir
     os.makedirs(out_dir, exist_ok=True)
 
-    # Model
     if backend == "lightgbm":
         mpath = os.path.join(out_dir, "model.txt")
         model.save_model(mpath)
@@ -396,12 +419,10 @@ def save_artifacts(model, calibrator, features, fold_metrics, args, backend, sid
         mpath = os.path.join(out_dir, "model.joblib")
         joblib.dump(model, mpath)
 
-    # Calibrator
     import joblib
     cpath = os.path.join(out_dir, f"calibrator_{side}.pkl")
     joblib.dump(calibrator, cpath)
 
-    # Metadata
     meta = {
         "backend": backend,
         "side": side,
@@ -411,6 +432,8 @@ def save_artifacts(model, calibrator, features, fold_metrics, args, backend, sid
         "pt_atr": 2.0,
         "sl_atr": 1.0,
         "zscore_window": args.zscore_window,
+        "recency_weight": args.recency_weight,
+        "lookback": args.lookback,
         "threshold": best_threshold,
         "expectancy": best_expectancy,
         "fold_metrics": fold_metrics,
@@ -423,77 +446,63 @@ def save_artifacts(model, calibrator, features, fold_metrics, args, backend, sid
     logger.info(f"Saved metadata -> {out_dir}/ensemble_metadata.json")
 
 
-# ---- CLI ----
 def main():
-    ap = argparse.ArgumentParser(description="Meta-Labeling v3 Single Model Trainer")
+    ap = argparse.ArgumentParser(description="Meta-Labeling v3 Trainer")
     ap.add_argument("--data", required=True)
     ap.add_argument("--label-col", type=str, default="tb_label")
     ap.add_argument("--use-gpu", action="store_true")
     ap.add_argument("--out-dir", type=str, default="train_pipeline/models_gpu")
     ap.add_argument("--side", type=str, default="long", choices=["long", "short"])
     ap.add_argument("--max-hold", type=int, default=60)
-    ap.add_argument("--expanded-features", action="store_true")
-    ap.add_argument("--microstructure-features", action="store_true")
-    ap.add_argument("--skip-feature-filter", action="store_true",
-                    help="Skip gain-based feature filtering (train on all features)")
-    ap.add_argument("--zscore-window", type=int, default=500,
-                    help="Rolling window for z-score normalization (500 for long, 250 for small datasets)")
+    ap.add_argument("--skip-feature-filter", action="store_true")
+    ap.add_argument("--zscore-window", type=int, default=500)
+    ap.add_argument("--recency-weight", action="store_true")
+    ap.add_argument("--recent-months", type=int, default=0)
+    ap.add_argument("--lookback", type=int, default=0)
+    ap.add_argument("--out-dir-suffix", type=str, default="")
     args = ap.parse_args()
+
+    if args.out_dir_suffix:
+        args.out_dir = args.out_dir + args.out_dir_suffix
 
     logger.info("=" * 65)
     logger.info(f"  Meta-Labeling v3 Training | side={args.side}")
-    logger.info(f"  Data: {args.data}")
-    logger.info(f"  Output: {args.out_dir}")
+    logger.info(f"  Data: {args.data} | Output: {args.out_dir} | Lookback: {args.lookback}")
     logger.info("=" * 65)
 
     device_type, gpu_active = detect_gpu() if args.use_gpu else ("cpu", False)
-
     df = pd.read_csv(args.data)
     df.columns = [c.lower().strip() for c in df.columns]
-    logger.info(f"Loaded {len(df):,} rows")
-
     if args.label_col not in df.columns:
-        logger.error(f"Label column '{args.label_col}' not found. Columns: {list(df.columns)[:20]}")
-        sys.exit(1)
+        logger.error(f"Label column '{args.label_col}' not found"); sys.exit(1)
 
-    # Drop timeouts (tb_label == 1), remap {2:1, 0:0}
+    if args.recent_months > 0 and "time" in df.columns:
+        cutoff = df["time"].max() - pd.DateOffset(months=args.recent_months)
+        df = df[df["time"] >= cutoff].copy()
+        logger.info(f"Recent {args.recent_months}m filter: {len(df):,} rows from {df['time'].min()}")
+
     timeout_count = (df[args.label_col] == 1).sum()
     df = df[df[args.label_col] != 1].copy().reset_index(drop=True)
     df[args.label_col] = df[args.label_col].map({2: 1, 0: 0})
     logger.info(f"Training on {len(df):,} clean events (timeouts dropped: {timeout_count:,})")
     logger.info(f"Label dist: {df[args.label_col].value_counts().sort_index().to_dict()}")
+    if len(df) < 100: logger.error("Min 100 events required. Abort."); sys.exit(1)
 
-    # Quality gate
-    if len(df) < 100:
-        logger.error(f"Only {len(df)} clean events — minimum 100 required. Abort.")
-        sys.exit(1)
+    X = compute_features(df, zscore_window=args.zscore_window, lookback=args.lookback)
+    feats = get_feature_list(X, lookback=args.lookback)
+    X = X[feats]; y = df[args.label_col].reset_index(drop=True).astype(int)
 
-    # Compute features
-    logger.info("Computing features...")
-    X = compute_features(df, zscore_window=args.zscore_window)
-    feats = get_feature_list(X)
-    X = X[feats]
-    y = df[args.label_col].reset_index(drop=True).astype(int)
+    model, survivors, fold_metrics, backend = train_model(
+        X, y, device_type, gpu_active, args.side,
+        skip_filter=args.skip_feature_filter, recency_weight=args.recency_weight)
 
-    # Train
-    model, survivors, fold_metrics, backend = train_model(X, y, device_type, gpu_active, args.side, skip_filter=args.skip_feature_filter)
-
-    # Calibration: hold out final 10% time block (never seen in training or validation)
     n_calib = max(int(len(X) * 0.1), 50)
-    X_calib = X[survivors].iloc[-n_calib:].values
-    y_calib = y.iloc[-n_calib:].values
-    logger.info(f"Calibration hold-out: {len(X_calib):,} rows (final 10% time block)")
-
+    X_calib = X[survivors].iloc[-n_calib:].values; y_calib = y.iloc[-n_calib:].values
     calibrator, cal_method, best_t, best_exp = calibrate_and_threshold(
-        model, X_calib, y_calib, fold_metrics, args.side, backend,
-    )
+        model, X_calib, y_calib, fold_metrics, args.side, backend)
 
-    # Save
-    save_artifacts(
-        model, calibrator, survivors, fold_metrics,
-        args, backend, args.side, best_t, best_exp,
-    )
-
+    save_artifacts(model, calibrator, survivors, fold_metrics,
+                   args, backend, args.side, best_t, best_exp)
     logger.info("Done.")
 
 

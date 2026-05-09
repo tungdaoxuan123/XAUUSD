@@ -484,6 +484,9 @@ def main():
         short_df = labeled[labeled["side"] == -1].copy()
 
         for side_tag, sdf in [("LONG", long_df), ("SHORT", short_df)]:
+            if len(sdf) == 0:
+                logger.info(f"{side_tag:5s} | No events — skipping")
+                continue
             clean = sdf[sdf["tb_label"].isin([0, 2])]
             n_clean = len(clean)
             n_total = len(sdf)
