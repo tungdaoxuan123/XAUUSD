@@ -65,7 +65,7 @@ MICRO_COLS = [
     "kyle_lambda", "vprof_poc_dist",
 ]
 
-MIN_CONTEXT_BARS = 15
+MIN_CONTEXT_BARS = 500
 
 
 # ---- GPU Detection ----
@@ -137,6 +137,18 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     # Synmicro (active only)
     for col in MICRO_COLS:
         df_out[col] = df[col].values.astype("float64") if col in df.columns else 0.0
+
+    # Rolling z-score normalization — regime-agnostic features
+    ROLLING = 500
+    zscore_cols = ["atr_norm", "kyle_lambda", "vprof_poc_dist", "ofi_window", "tick_imbalance"]
+    for col in zscore_cols:
+        if col not in df_out.columns:
+            continue
+        raw = df_out[col].values
+        rm = pd.Series(raw).rolling(ROLLING, min_periods=50).mean().values
+        rs = pd.Series(raw).rolling(ROLLING, min_periods=50).std().values
+        df_out[col] = np.clip((raw - rm) / (rs + 1e-9), -5, 5)
+        df_out[col] = np.nan_to_num(df_out[col], nan=0.0)
 
     return df_out
 

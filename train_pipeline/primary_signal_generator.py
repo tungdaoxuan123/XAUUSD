@@ -96,7 +96,7 @@ def filter_events(df: pd.DataFrame) -> pd.DataFrame:
     atr50 = atr14.rolling(50).mean()
 
     # Volatility filter (must have enough data)
-    vol_ok = atr14 > atr50 * 0.8
+    vol_ok = atr14 > atr50 * 0.5
 
     # Setup A — Long Pullback
     trend_up = ema5 > ema20

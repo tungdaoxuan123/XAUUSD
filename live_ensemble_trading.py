@@ -104,7 +104,26 @@ class LiveEnsembleTrader:
         if not self.interface.authorized:
             self.interface.initialize()
         self.symbol = self.interface.symbol
+
+        # Rolling z-score buffers for regime-agnostic features (500 bars)
+        self._zscore_bufs: Dict[str, list] = {}
+        for k in ["atr_norm", "kyle_lambda", "vprof_poc_dist", "ofi_window", "tick_imbalance"]:
+            self._zscore_bufs[k] = []
+
         logger.info(f"Dual-model bot ready | symbol={self.symbol}")
+
+    def _zscore(self, key: str, raw_val: float) -> float:
+        buf = self._zscore_bufs[key]
+        buf.append(raw_val)
+        if len(buf) > 500:
+            buf.pop(0)
+        if len(buf) < 50:
+            return raw_val
+        m = np.mean(buf)
+        s = np.std(buf)
+        if s < 1e-9:
+            return 0.0
+        return float(np.clip((raw_val - m) / s, -5, 5))
 
     def _compute_indicators(self, df):
         close = df["close"]
@@ -206,6 +225,14 @@ class LiveEnsembleTrader:
         feat["ema_gap"] = (ema5[i] - ema20[i]) / (atr[i] + 1e-9)
         feat["ema_gap_delta"] = feat["ema_gap"] - (ema5[i - 5] - ema20[i - 5]) / (atr[i - 5] + 1e-9)
 
+        # Microstructure features from latest bar (fall back to 0 if not in OHLCV)
+        for mc in ["tick_imbalance", "ofi_window", "cs_spread", "kyle_lambda", "vprof_poc_dist"]:
+            feat[mc] = float(df.iloc[i][mc]) if mc in df.columns else 0.0
+
+        # Apply rolling z-score to regime-sensitive features
+        for zk in ["atr_norm", "kyle_lambda", "vprof_poc_dist", "ofi_window", "tick_imbalance"]:
+            feat[zk] = self._zscore(zk, feat.get(zk, 0.0))
+
         return feat
 
     def run(self, interval_s: int = 10, dry_run: bool = False):
@@ -231,7 +258,7 @@ class LiveEnsembleTrader:
                     time.sleep(10); continue
 
                 # Fetch data
-                rates = self.interface.get_rates(count=200)
+                rates = self.interface.get_rates(count=700)
                 if rates is None or len(rates) < 60:
                     continue
                 df = pd.DataFrame(rates)
