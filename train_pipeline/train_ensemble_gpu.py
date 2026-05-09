@@ -52,21 +52,17 @@ logger = logging.getLogger("TrainGPU")
 
 # ---- Feature definitions ----
 SNAPSHOT_FEATURES = [
-    "rsi_14", "macd_hist", "atr_norm", "ema_ratio",
-    "close_minus_vwap_norm", "bb_position",
-    "candle_body", "upper_wick", "lower_wick",
-    "vol_zscore", "range_vs_atr",
+    "atr_norm", "bb_position", "candle_body",
+    "upper_wick", "lower_wick", "range_vs_atr",
 ]
 
 VELOCITY_FEATURES = [
-    "pullback_speed", "atr_ratio", "vwap_slope_5",
-    "rsi_delta_5", "volume_ratio", "ema_gap", "ema_gap_delta",
+    "pullback_speed", "vwap_slope_5", "volume_ratio",
 ]
 
 MICRO_COLS = [
     "tick_imbalance", "ofi_window", "cs_spread",
-    "kyle_lambda", "vprof_poc_dist", "amihud",
-    "jump_flag", "regime_flag",
+    "kyle_lambda", "vprof_poc_dist",
 ]
 
 MIN_CONTEXT_BARS = 15
@@ -115,43 +111,30 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
 
     df_out = pd.DataFrame(index=df.index)
 
-    # Snapshot
-    df_out["rsi_14"] = rsi
-    df_out["macd_hist"] = macd_h
+    # Snapshot (active only)
     df_out["atr_norm"] = atr / (close + 1e-9)
-    df_out["ema_ratio"] = ema5 / (ema20 + 1e-9)
-    df_out["close_minus_vwap_norm"] = (close - vwap) / (atr + 1e-9)
     df_out["bb_position"] = bb_pos
     df_out["candle_body"] = (close - open_v) / (atr + 1e-9)
     df_out["upper_wick"] = (high - np.maximum(open_v, close)) / (atr + 1e-9)
     df_out["lower_wick"] = (np.minimum(open_v, close) - low) / (atr + 1e-9)
-    df_out["vol_zscore"] = (atr - pd.Series(atr).rolling(100, min_periods=10).mean().values) / (pd.Series(atr).rolling(100, min_periods=10).std().values + 1e-9)
     df_out["range_vs_atr"] = (high - low) / (atr + 1e-9)
 
-    # Velocity
+    # Velocity (active only)
     n = len(df)
     for i in range(n):
         if i < MIN_CONTEXT_BARS:
             df_out.loc[i, "pullback_speed"] = 0.0
-            df_out.loc[i, "atr_ratio"] = 1.0
             df_out.loc[i, "vwap_slope_5"] = 0.0
-            df_out.loc[i, "rsi_delta_5"] = 0.0
             df_out.loc[i, "volume_ratio"] = 1.0
-            df_out.loc[i, "ema_gap"] = 0.0
-            df_out.loc[i, "ema_gap_delta"] = 0.0
             continue
 
-        df_out.loc[i, "pullback_speed"] = (close[i] - close[i - 5]) / (atr[i] * 5 + 1e-9)
-        df_out.loc[i, "atr_ratio"] = atr[i] / (atr[i - 10] + 1e-9)
+        df_out.loc[i, "pullback_speed"] = np.clip((close[i] - close[i - 5]) / (atr[i] * 5 + 1e-9), -10, 10)
         df_out.loc[i, "vwap_slope_5"] = (vwap[i] - vwap[i - 5]) / (atr[i] + 1e-9)
-        df_out.loc[i, "rsi_delta_5"] = rsi[i] - rsi[i - 5]
         df_out.loc[i, "volume_ratio"] = vol[i] / (np.mean(vol[max(0, i - 5):i]) + 1e-9)
-        df_out.loc[i, "ema_gap"] = (ema5[i] - ema20[i]) / (atr[i] + 1e-9)
-        df_out.loc[i, "ema_gap_delta"] = df_out.loc[i, "ema_gap"] - ((ema5[i - 5] - ema20[i - 5]) / (atr[i - 5] + 1e-9))
 
     df_out = df_out.replace([np.inf, -np.inf], np.nan).fillna(0)
 
-    # Synmicro
+    # Synmicro (active only)
     for col in MICRO_COLS:
         df_out[col] = df[col].values.astype("float64") if col in df.columns else 0.0
 
@@ -188,82 +171,79 @@ def _train_lgbm(X: pd.DataFrame, y: pd.Series, device_type: str, use_gpu: bool,
                  skip_filter: bool = False):
     feats = list(X.columns)
     y_enc = y.values.astype(int)
-    tscv = TimeSeriesSplit(n_splits=5)
-    fold_metrics = []
-    importance_sums = np.zeros(len(feats))
 
-    for fold, (tr, va) in enumerate(tscv.split(X)):
-        X_tr = X.iloc[tr].astype(np.float32).values
-        X_va = X.iloc[va].astype(np.float32).values
-        y_tr = y_enc[tr]
-        y_va = y_enc[va]
+    # Time-split: 70% train, 30% validation
+    cut = int(len(X) * 0.7)
+    X_tr = X.iloc[:cut].astype(np.float32).values
+    X_va = X.iloc[cut:].astype(np.float32).values
+    y_tr = y_enc[:cut]
+    y_va = y_enc[cut:]
 
-        n_neg = (y_tr == 0).sum()
-        n_pos = max((y_tr == 1).sum(), 1)
-        scale_pos_weight = n_neg / n_pos
+    logger.info(f"Time-split: train={len(X_tr):,} (first 70%) | val={len(X_va):,} (last 30%)")
 
-        params = {
-            "objective": "binary",
-            "device_type": device_type,
-            "verbose": -1,
-            "random_state": 42,
-            "max_bin": 63,
-            "num_leaves": 31,
-            "max_depth": 6,
-            "min_child_samples": 30,
-            "n_estimators": 300,
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            "lambda_l1": 0.5,
-            "lambda_l2": 0.5,
-            "scale_pos_weight": scale_pos_weight,
-            "learning_rate": 0.02,
-        }
+    n_neg = (y_tr == 0).sum()
+    n_pos = max((y_tr == 1).sum(), 1)
+    scale_pos_weight = min(n_neg / n_pos, 3.0)
 
-        train_ds = lgb.Dataset(X_tr, label=y_tr)
-        val_ds = lgb.Dataset(X_va, label=y_va, reference=train_ds)
+    params = {
+        "objective": "binary",
+        "device_type": device_type,
+        "verbose": -1,
+        "random_state": 42,
+        "max_bin": 63,
+        "num_leaves": 31,
+        "max_depth": 6,
+        "min_child_samples": 30,
+        "n_estimators": 500,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "lambda_l1": 0.5,
+        "lambda_l2": 0.5,
+        "scale_pos_weight": scale_pos_weight,
+        "learning_rate": 0.02,
+    }
 
-        model = lgb.train(
-            params, train_ds, num_boost_round=500,
-            valid_sets=[val_ds],
-            callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(-1)],
-        )
+    train_ds = lgb.Dataset(X_tr, label=y_tr)
+    val_ds = lgb.Dataset(X_va, label=y_va, reference=train_ds)
 
-        p = model.predict(X_va)
-        y_pred = (p >= 0.5).astype(int)
-        acc = accuracy_score(y_va, y_pred)
-        f1 = f1_score(y_va, y_pred, average="binary", zero_division=0)
-        logger.info(f"  Fold {fold+1}/5 | Acc: {acc:.4f} | F1: {f1:.4f} | N_pos: {y_tr.sum()}/{len(y_tr)}")
-        fold_metrics.append({"fold": fold + 1, "accuracy": acc, "binary_f1": f1})
+    model = lgb.train(
+        params, train_ds, num_boost_round=500,
+        valid_sets=[val_ds],
+        callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(-1)],
+    )
 
-        imp = model.feature_importance(importance_type="gain")
-        if len(imp) == len(feats):
-            importance_sums += imp / max(imp.sum(), 1)
+    p = model.predict(X_va)
+    y_pred = (p >= 0.5).astype(int)
+    acc = accuracy_score(y_va, y_pred)
+    f1 = f1_score(y_va, y_pred, average="binary", zero_division=0)
+    cm = confusion_matrix(y_va, y_pred, labels=[0, 1])
+    logger.info(f"  Val | Acc: {acc:.4f} | F1: {f1:.4f}")
+    logger.info(f"  Confusion:\n{cm}")
+    fold_metrics = [{"accuracy": acc, "binary_f1": f1}]
 
-    mean_imp = importance_sums / 5
+    imp = model.feature_importance(importance_type="gain")
+    mean_imp = imp / max(imp.sum(), 1)
     imp_df = pd.DataFrame({"feature": feats, "importance": mean_imp}).sort_values("importance", ascending=False)
     logger.info(f"Feature importance:\n{imp_df.to_string()}")
 
-    # Filter: keep features where mean importance > 0.001 * max (unless skipped)
     if skip_filter:
         survivors = feats[:]
         logger.info("Feature filter skipped — training on all features")
     else:
         threshold = 0.001 * max(mean_imp.max(), 1e-9)
         survivors = [feats[i] for i in range(len(feats)) if mean_imp[i] > threshold]
-        logger.info(f"Surviving features after gain filter ({len(survivors)}/{len(feats)}): {survivors}")
+        logger.info(f"Surviving features ({len(survivors)}/{len(feats)}): {survivors}")
 
-    # Retrain on full data with survivors
+    # Retrain on full data
     if len(survivors) > 0:
         X_surv = X[survivors].astype(np.float32).values
     else:
-        logger.warning("No features survived gain filter — using all features")
         X_surv = X.astype(np.float32).values
         survivors = feats
 
     n_neg_f = (y_enc == 0).sum()
     n_pos_f = max((y_enc == 1).sum(), 1)
-    params["scale_pos_weight"] = n_neg_f / n_pos_f
+    params["scale_pos_weight"] = min(n_neg_f / n_pos_f, 3.0)
 
     full_ds = lgb.Dataset(X_surv, label=y_enc)
     full_model = lgb.train(params, full_ds, num_boost_round=500)
@@ -302,6 +282,22 @@ def _train_logreg(X: pd.DataFrame, y: pd.Series):
 
 
 # ---- Calibration ----
+class CalibratedWrapper(BaseEstimator, ClassifierMixin):
+    """Wraps a raw binary model for sklearn CalibratedClassifierCV."""
+
+    def __init__(self, base_model, backend: str):
+        self.base_model = base_model
+        self.backend = backend
+
+    def fit(self, X, y):
+        self.classes_ = np.array([0, 1])
+        return self
+
+    def predict_proba(self, X):
+        p = _predict_proba(self.base_model, X, self.backend)
+        return np.column_stack([1 - p, p])
+
+
 def calibrate_and_threshold(model, X_calib: np.ndarray, y_calib: np.ndarray,
                             fold_metrics: list, side: str, backend: str):
     """Calibrate model on holdout and find optimal threshold."""
@@ -316,21 +312,8 @@ def calibrate_and_threshold(model, X_calib: np.ndarray, y_calib: np.ndarray,
         cal_method = "sigmoid"
         logger.warning(f"Holdout N={n} < 200 -> using Platt Scaling (sigmoid)")
 
-    # Wrap raw model to calibrate
-    class _Wrapper(BaseEstimator, ClassifierMixin):
-        def __init__(self, pred_fn, backend):
-            self.pred_fn = pred_fn
-            self.backend = backend
-        def fit(self, X, y):
-            self.classes_ = np.array([0, 1])
-            return self
-        def predict_proba(self, X):
-            p = self.pred_fn(X)
-            return np.column_stack([1 - p, p])
-
-    wrapper = _Wrapper(lambda x: _predict_proba(model, x, backend), backend)
+    wrapper = CalibratedWrapper(model, backend)
     wrapper.fit(X_calib, y_calib)
-    wrapper.classes_ = np.array([0, 1])
     cal = CalibratedClassifierCV(estimator=wrapper, method=cal_method, cv="prefit")
     cal.fit(X_calib, y_calib)
     p_cal = cal.predict_proba(X_calib)[:, 1]
@@ -362,6 +345,18 @@ def calibrate_and_threshold(model, X_calib: np.ndarray, y_calib: np.ndarray,
 
     logger.info(f"Optimal threshold: {best_t:.2f} | Expectancy: {best_exp:.3f}R | "
                 f"Win rate: {best_wr:.1%} | N trades: {best_n}")
+
+    # Log specific thresholds for manual inspection
+    for t_check in [0.45, 0.50, 0.55]:
+        preds = (p_cal >= t_check).astype(int)
+        n_tr = preds.sum()
+        if n_tr >= 10:
+            wr = preds[y_calib == 1].sum() / max(preds.sum(), 1)
+            exp = wr * 2 - (1 - wr) * 1
+            logger.info(f"  Threshold {t_check:.2f}: Expectancy={exp:+.3f}R | "
+                        f"Win rate={wr:.1%} | N={n_tr}")
+        else:
+            logger.info(f"  Threshold {t_check:.2f}: N={n_tr} (<10 — insufficient)")
 
     return cal, cal_method, best_t, best_exp
 
@@ -466,21 +461,21 @@ def main():
     y = df[args.label_col].reset_index(drop=True).astype(int)
 
     # Train
-    model, feat_importance, fold_metrics, backend = train_model(X, y, device_type, gpu_active, args.side, skip_filter=args.skip_feature_filter)
+    model, survivors, fold_metrics, backend = train_model(X, y, device_type, gpu_active, args.side, skip_filter=args.skip_feature_filter)
 
-    # Calibration on last 20% of data (or full data if too small)
-    n_calib = max(int(len(X) * 0.2), 50)
-    n_calib = min(n_calib, len(X) - 50)
-    X_calib_np = X.iloc[-n_calib:].values
-    y_calib_np = y.iloc[-n_calib:].values
+    # Calibration: hold out final 10% time block (never seen in training or validation)
+    n_calib = max(int(len(X) * 0.1), 50)
+    X_calib = X[survivors].iloc[-n_calib:].values
+    y_calib = y.iloc[-n_calib:].values
+    logger.info(f"Calibration hold-out: {len(X_calib):,} rows (final 10% time block)")
 
     calibrator, cal_method, best_t, best_exp = calibrate_and_threshold(
-        model, X_calib_np, y_calib_np, fold_metrics, args.side, backend,
+        model, X_calib, y_calib, fold_metrics, args.side, backend,
     )
 
     # Save
     save_artifacts(
-        model, calibrator, feat_importance, fold_metrics,
+        model, calibrator, survivors, fold_metrics,
         args, backend, args.side, best_t, best_exp,
     )
 
