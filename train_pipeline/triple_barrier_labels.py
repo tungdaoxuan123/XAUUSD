@@ -167,16 +167,16 @@ def triple_barrier_labels(
     if missing:
         raise ValueError(f"Missing columns: {missing}")
 
-    close = df["close"].values.astype("float64")
-    high  = df["high"].values.astype("float64")
-    low   = df["low"].values.astype("float64")
-    atr   = df["ATR"].values.astype("float64")
-    n     = len(df)
+    close = df["close"].values.astype("float64").ravel()
+    high  = df["high"].values.astype("float64").ravel()
+    low   = df["low"].values.astype("float64").ravel()
+    atr   = df["ATR"].values.astype("float64").ravel()
+    n     = len(close)
 
-    spread_arr = _resolve_spread_series(df).values.astype("float64")
+    spread_arr = _resolve_spread_series(df).values.astype("float64").ravel()
 
     if side_col:
-        raw_side = df[side_col].values.astype("int8")
+        raw_side = df[side_col].values.astype("int8").ravel()
         # Only evaluate entries matching our direction
         side = np.where(raw_side == direction, direction, 0).astype("int8")
     else:
@@ -326,14 +326,14 @@ def triple_barrier_events(
     if missing:
         raise ValueError(f"Missing columns: {missing}")
 
-    close = df["close"].values.astype("float64")
-    high = df["high"].values.astype("float64")
-    low = df["low"].values.astype("float64")
-    atr = df["ATR"].values.astype("float64")
-    n = len(df)
+    close = df["close"].values.astype("float64").ravel()
+    high = df["high"].values.astype("float64").ravel()
+    low = df["low"].values.astype("float64").ravel()
+    atr = df["ATR"].values.astype("float64").ravel()
+    n = len(close)
 
-    side_arr = df["side"].values.astype("int8")
-    spread_arr = _resolve_spread_series(df).values.astype("float64")
+    side_arr = df["side"].values.astype("int8").ravel()
+    spread_arr = _resolve_spread_series(df).values.astype("float64").ravel()
 
     tb_label = np.zeros(n, dtype="int8")
     tb_ret = np.zeros(n, dtype="float32")

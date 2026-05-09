@@ -437,7 +437,7 @@ def main():
 
     # Drop timeouts (tb_label == 1), remap {2:1, 0:0}
     timeout_count = (df[args.label_col] == 1).sum()
-    df = df[df[args.label_col] != 1].copy()
+    df = df[df[args.label_col] != 1].copy().reset_index(drop=True)
     df[args.label_col] = df[args.label_col].map({2: 1, 0: 0})
     logger.info(f"Training on {len(df):,} clean events (timeouts dropped: {timeout_count:,})")
     logger.info(f"Label dist: {df[args.label_col].value_counts().sort_index().to_dict()}")
