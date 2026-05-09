@@ -47,7 +47,9 @@ class DirectionModel:
 
         self.features = self.meta.get("features", [])
         self.threshold = self.meta.get("threshold", 0.5)
-        logger.info(f"[{side.upper()}] Loaded | features={len(self.features)} | threshold={self.threshold:.2f}")
+        self.zscore_window = self.meta.get("zscore_window", 500)
+        logger.info(f"[{side.upper()}] Loaded | features={len(self.features)} | "
+                    f"threshold={self.threshold:.2f} | zscore_win={self.zscore_window}")
 
         self.model = self._load_model(model_dir)
         self.calibrator = self._load_calibrator(model_dir)
@@ -105,25 +107,25 @@ class LiveEnsembleTrader:
             self.interface.initialize()
         self.symbol = self.interface.symbol
 
-        # Rolling z-score buffers for regime-agnostic features (500 bars)
+        # Rolling z-score buffers for regime-agnostic features
         self._zscore_bufs: Dict[str, list] = {}
+        self._zscore_win = 500  # overridden by model metadata at predict time
         for k in ["atr_norm", "kyle_lambda", "vprof_poc_dist", "ofi_window", "tick_imbalance"]:
             self._zscore_bufs[k] = []
 
-        logger.info(f"Dual-model bot ready | symbol={self.symbol}")
-
-    def _zscore(self, key: str, raw_val: float) -> float:
+    def _zscore(self, key: str, raw_val: float, win: int = None) -> float:
+        w = win or self._zscore_win
         buf = self._zscore_bufs[key]
         buf.append(raw_val)
-        if len(buf) > 500:
+        if len(buf) > w:
             buf.pop(0)
-        if len(buf) < 50:
+        if len(buf) < max(50, w // 5):
             return raw_val
         m = np.mean(buf)
         s = np.std(buf)
         if s < 1e-9:
             return 0.0
-        return float(np.clip((raw_val - m) / s, -5, 5))
+        return float(np.clip((raw_val - m) / s, -4, 4))
 
     def _compute_indicators(self, df):
         close = df["close"]
@@ -229,10 +231,6 @@ class LiveEnsembleTrader:
         for mc in ["tick_imbalance", "ofi_window", "cs_spread", "kyle_lambda", "vprof_poc_dist"]:
             feat[mc] = float(df.iloc[i][mc]) if mc in df.columns else 0.0
 
-        # Apply rolling z-score to regime-sensitive features
-        for zk in ["atr_norm", "kyle_lambda", "vprof_poc_dist", "ofi_window", "tick_imbalance"]:
-            feat[zk] = self._zscore(zk, feat.get(zk, 0.0))
-
         return feat
 
     def run(self, interval_s: int = 10, dry_run: bool = False):
@@ -280,6 +278,10 @@ class LiveEnsembleTrader:
                     feat = self._compute_live_features(df)
                     if feat is None:
                         continue
+
+                    # Apply rolling z-score with model-specific window
+                    for zk in ["atr_norm", "kyle_lambda", "vprof_poc_dist", "ofi_window", "tick_imbalance"]:
+                        feat[zk] = self._zscore(zk, feat.get(zk, 0.0), win=model.zscore_window)
 
                     # Build feature vector in model's expected order
                     f_list = [feat.get(f, 0.0) for f in model.features]

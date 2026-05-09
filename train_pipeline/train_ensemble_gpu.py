@@ -83,7 +83,7 @@ def detect_gpu():
 
 
 # ---- Feature computation ----
-def compute_features(df: pd.DataFrame) -> pd.DataFrame:
+def compute_features(df: pd.DataFrame, zscore_window: int = 500) -> pd.DataFrame:
     """Compute snapshot + velocity features from OHLCV + indicator data."""
     close = df["close"].values.astype("float64")
     high = df["high"].values.astype("float64")
@@ -139,15 +139,15 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
         df_out[col] = df[col].values.astype("float64") if col in df.columns else 0.0
 
     # Rolling z-score normalization — regime-agnostic features
-    ROLLING = 500
+    ROLLING = zscore_window
     zscore_cols = ["atr_norm", "kyle_lambda", "vprof_poc_dist", "ofi_window", "tick_imbalance"]
     for col in zscore_cols:
         if col not in df_out.columns:
             continue
         raw = df_out[col].values
-        rm = pd.Series(raw).rolling(ROLLING, min_periods=50).mean().values
-        rs = pd.Series(raw).rolling(ROLLING, min_periods=50).std().values
-        df_out[col] = np.clip((raw - rm) / (rs + 1e-9), -5, 5)
+        rm = pd.Series(raw).rolling(ROLLING, min_periods=max(50, ROLLING // 5)).mean().values
+        rs = pd.Series(raw).rolling(ROLLING, min_periods=max(50, ROLLING // 5)).std().values
+        df_out[col] = np.clip((raw - rm) / (rs + 1e-9), -4, 4)
         df_out[col] = np.nan_to_num(df_out[col], nan=0.0)
 
     return df_out
@@ -410,6 +410,7 @@ def save_artifacts(model, calibrator, features, fold_metrics, args, backend, sid
         "label_horizon": args.max_hold,
         "pt_atr": 2.0,
         "sl_atr": 1.0,
+        "zscore_window": args.zscore_window,
         "threshold": best_threshold,
         "expectancy": best_expectancy,
         "fold_metrics": fold_metrics,
@@ -435,6 +436,8 @@ def main():
     ap.add_argument("--microstructure-features", action="store_true")
     ap.add_argument("--skip-feature-filter", action="store_true",
                     help="Skip gain-based feature filtering (train on all features)")
+    ap.add_argument("--zscore-window", type=int, default=500,
+                    help="Rolling window for z-score normalization (500 for long, 250 for small datasets)")
     args = ap.parse_args()
 
     logger.info("=" * 65)
@@ -467,7 +470,7 @@ def main():
 
     # Compute features
     logger.info("Computing features...")
-    X = compute_features(df)
+    X = compute_features(df, zscore_window=args.zscore_window)
     feats = get_feature_list(X)
     X = X[feats]
     y = df[args.label_col].reset_index(drop=True).astype(int)

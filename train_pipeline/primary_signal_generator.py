@@ -107,10 +107,21 @@ def filter_events(df: pd.DataFrame) -> pd.DataFrame:
 
     # Setup B — Short Pullback
     trend_dn = ema5 < ema20
-    below_vwap = close < vwap
+    below_structure = close < ema20   # relaxed from VWAP to EMA20 for symmetry
     # EMA loss: close[i-1] > EMA20[i-1] AND close[i] < EMA20[i]
     lose = (close.shift(1) > ema20.shift(1)) & (close < ema20)
-    setup_b = trend_dn & below_vwap & lose & vol_ok
+    setup_b = trend_dn & below_structure & lose & vol_ok
+
+    # Diagnostic: per-condition pass rates
+    n_total = int((~df["ATR"].isna()).sum())
+    logger.info(f"  Condition breakdown (n={n_total:,} valid bars):")
+    logger.info(f"    trend_up  (EMA5 > EMA20)    : {trend_up.sum():>8,}  ({trend_up.sum()/max(n_total,1)*100:.1f}%)")
+    logger.info(f"    above_vwap (close > VWAP)    : {above_vwap.sum():>8,}  ({above_vwap.sum()/max(n_total,1)*100:.1f}%)")
+    logger.info(f"    reclaim   (EMA cross up)     : {reclaim.sum():>8,}  ({reclaim.sum()/max(n_total,1)*100:.2f}%)")
+    logger.info(f"    trend_dn  (EMA5 < EMA20)    : {trend_dn.sum():>8,}  ({trend_dn.sum()/max(n_total,1)*100:.1f}%)")
+    logger.info(f"    <EMA20    (close < EMA20)    : {below_structure.sum():>8,}  ({below_structure.sum()/max(n_total,1)*100:.1f}%)")
+    logger.info(f"    lose      (EMA cross down)   : {lose.sum():>8,}  ({lose.sum()/max(n_total,1)*100:.2f}%)")
+    logger.info(f"    vol_ok    (ATR > 0.5*ATR50)  : {vol_ok.sum():>8,}  ({vol_ok.sum()/max(n_total,1)*100:.1f}%)")
 
     # Mutual exclusion
     both = setup_a & setup_b
