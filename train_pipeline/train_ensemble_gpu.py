@@ -37,6 +37,7 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.base import BaseEstimator, ClassifierMixin
 
 Path("train_pipeline/reports").mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
@@ -164,7 +165,8 @@ def get_feature_list(df_out: pd.DataFrame) -> list:
 
 # ---- Training ----
 def train_model(
-    X: pd.DataFrame, y: pd.Series, device_type: str, use_gpu: bool, side: str
+    X: pd.DataFrame, y: pd.Series, device_type: str, use_gpu: bool, side: str,
+    skip_filter: bool = False,
 ):
     n_clean = len(X)
     logger.info(f"Training on {n_clean:,} clean events | side={side}")
@@ -172,7 +174,7 @@ def train_model(
 
     if n_clean >= 500 and LIGHTGBM_AVAILABLE:
         logger.info("N >= 500 -> LightGBM")
-        model, feat_importance, fold_metrics = _train_lgbm(X, y, device_type, use_gpu)
+        model, feat_importance, fold_metrics = _train_lgbm(X, y, device_type, use_gpu, skip_filter)
         backend = "lightgbm"
     else:
         logger.warning(f"N={n_clean} < 500 -> LogisticRegression")
@@ -182,7 +184,8 @@ def train_model(
     return model, feat_importance, fold_metrics, backend
 
 
-def _train_lgbm(X: pd.DataFrame, y: pd.Series, device_type: str, use_gpu: bool):
+def _train_lgbm(X: pd.DataFrame, y: pd.Series, device_type: str, use_gpu: bool,
+                 skip_filter: bool = False):
     feats = list(X.columns)
     y_enc = y.values.astype(int)
     tscv = TimeSeriesSplit(n_splits=5)
@@ -205,25 +208,25 @@ def _train_lgbm(X: pd.DataFrame, y: pd.Series, device_type: str, use_gpu: bool):
             "verbose": -1,
             "random_state": 42,
             "max_bin": 63,
-            "num_leaves": 15,
-            "max_depth": 4,
-            "min_child_samples": 100,
-            "n_estimators": 200,
-            "subsample": 0.7,
-            "colsample_bytree": 0.7,
-            "lambda_l1": 1.0,
-            "lambda_l2": 1.0,
+            "num_leaves": 31,
+            "max_depth": 6,
+            "min_child_samples": 30,
+            "n_estimators": 300,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+            "lambda_l1": 0.5,
+            "lambda_l2": 0.5,
             "scale_pos_weight": scale_pos_weight,
-            "learning_rate": 0.05,
+            "learning_rate": 0.02,
         }
 
         train_ds = lgb.Dataset(X_tr, label=y_tr)
         val_ds = lgb.Dataset(X_va, label=y_va, reference=train_ds)
 
         model = lgb.train(
-            params, train_ds, num_boost_round=200,
+            params, train_ds, num_boost_round=500,
             valid_sets=[val_ds],
-            callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)],
+            callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(-1)],
         )
 
         p = model.predict(X_va)
@@ -241,10 +244,14 @@ def _train_lgbm(X: pd.DataFrame, y: pd.Series, device_type: str, use_gpu: bool):
     imp_df = pd.DataFrame({"feature": feats, "importance": mean_imp}).sort_values("importance", ascending=False)
     logger.info(f"Feature importance:\n{imp_df.to_string()}")
 
-    # Filter: keep features where mean importance > 0.001 * max
-    threshold = 0.001 * max(mean_imp.max(), 1e-9)
-    survivors = [feats[i] for i in range(len(feats)) if mean_imp[i] > threshold]
-    logger.info(f"Surviving features after gain filter ({len(survivors)}/{len(feats)}): {survivors}")
+    # Filter: keep features where mean importance > 0.001 * max (unless skipped)
+    if skip_filter:
+        survivors = feats[:]
+        logger.info("Feature filter skipped — training on all features")
+    else:
+        threshold = 0.001 * max(mean_imp.max(), 1e-9)
+        survivors = [feats[i] for i in range(len(feats)) if mean_imp[i] > threshold]
+        logger.info(f"Surviving features after gain filter ({len(survivors)}/{len(feats)}): {survivors}")
 
     # Retrain on full data with survivors
     if len(survivors) > 0:
@@ -259,7 +266,7 @@ def _train_lgbm(X: pd.DataFrame, y: pd.Series, device_type: str, use_gpu: bool):
     params["scale_pos_weight"] = n_neg_f / n_pos_f
 
     full_ds = lgb.Dataset(X_surv, label=y_enc)
-    full_model = lgb.train(params, full_ds, num_boost_round=200)
+    full_model = lgb.train(params, full_ds, num_boost_round=500)
 
     return full_model, survivors, fold_metrics
 
@@ -304,25 +311,27 @@ def calibrate_and_threshold(model, X_calib: np.ndarray, y_calib: np.ndarray,
     p_raw = _predict_proba(model, X_calib, backend)
 
     if n >= 200:
-        cal = CalibratedClassifierCV(estimator=None, method="isotonic", cv="prefit")
         cal_method = "isotonic"
     else:
-        cal = CalibratedClassifierCV(estimator=None, method="sigmoid", cv="prefit")
         cal_method = "sigmoid"
         logger.warning(f"Holdout N={n} < 200 -> using Platt Scaling (sigmoid)")
 
     # Wrap raw model to calibrate
-    class _Wrapper:
+    class _Wrapper(BaseEstimator, ClassifierMixin):
         def __init__(self, pred_fn, backend):
             self.pred_fn = pred_fn
             self.backend = backend
-        def fit(self, X, y): pass
+        def fit(self, X, y):
+            self.classes_ = np.array([0, 1])
+            return self
         def predict_proba(self, X):
             p = self.pred_fn(X)
             return np.column_stack([1 - p, p])
 
     wrapper = _Wrapper(lambda x: _predict_proba(model, x, backend), backend)
     wrapper.fit(X_calib, y_calib)
+    wrapper.classes_ = np.array([0, 1])
+    cal = CalibratedClassifierCV(estimator=wrapper, method=cal_method, cv="prefit")
     cal.fit(X_calib, y_calib)
     p_cal = cal.predict_proba(X_calib)[:, 1]
 
@@ -415,8 +424,10 @@ def main():
     ap.add_argument("--out-dir", type=str, default="train_pipeline/models_gpu")
     ap.add_argument("--side", type=str, default="long", choices=["long", "short"])
     ap.add_argument("--max-hold", type=int, default=60)
-    ap.add_argument("--expanded-features", action="store_true")  # ignored, kept for compat
-    ap.add_argument("--microstructure-features", action="store_true")  # ignored
+    ap.add_argument("--expanded-features", action="store_true")
+    ap.add_argument("--microstructure-features", action="store_true")
+    ap.add_argument("--skip-feature-filter", action="store_true",
+                    help="Skip gain-based feature filtering (train on all features)")
     args = ap.parse_args()
 
     logger.info("=" * 65)
@@ -455,7 +466,7 @@ def main():
     y = df[args.label_col].reset_index(drop=True).astype(int)
 
     # Train
-    model, feat_importance, fold_metrics, backend = train_model(X, y, device_type, gpu_active, args.side)
+    model, feat_importance, fold_metrics, backend = train_model(X, y, device_type, gpu_active, args.side, skip_filter=args.skip_feature_filter)
 
     # Calibration on last 20% of data (or full data if too small)
     n_calib = max(int(len(X) * 0.2), 50)
