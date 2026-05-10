@@ -39,7 +39,7 @@ logger = logging.getLogger("PrimarySignal")
 
 OUTPUT_COLUMNS = [
     "time", "open", "high", "low", "close", "tick_volume",
-    "ATR", "EMA5", "EMA20", "VWAP", "RSI", "MACD_Hist", "side",
+    "ATR", "EMA5", "EMA20", "VWAP", "RSI", "MACD_Hist", "volume_ratio", "side",
 ]
 
 
@@ -82,6 +82,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     signal_line = macd_line.ewm(span=9, adjust=False).mean()
     df["MACD_Hist"] = macd_line - signal_line
 
+    # Volume ratio for exhaustion signal
+    df["volume_ratio"] = vol / vol.rolling(20).mean()
+
     df = df.replace([np.inf, -np.inf], np.nan)
     return df
 
@@ -112,14 +115,21 @@ def filter_events(df: pd.DataFrame) -> pd.DataFrame:
     )
     setup_a = long_signal
 
-    # Setup B — Short Pullback
-    trend_dn = ema5 < ema20
-    below_vwap = close < vwap
-    below_ema20 = close < ema20   # relaxed: more short events, used when --side short
-    # EMA loss: close[i-1] > EMA20[i-1] AND close[i] < EMA20[i]
-    lose = (close.shift(1) > ema20.shift(1)) & (close < ema20)
-    setup_b_vwap = trend_dn & below_vwap & lose & vol_ok      # strict (VWAP)
-    setup_b_ema20 = trend_dn & below_ema20 & lose & vol_ok    # relaxed (EMA20)
+    # Setup B — SHORT: Exhaustion Blow-Off Top Reversal
+    volume_ratio = df["volume_ratio"]
+    consecutive_green = (
+        (close > close.shift(1)) &
+        (close.shift(1) > close.shift(2)) &
+        (close.shift(2) > close.shift(3)) &
+        (close.shift(3) > close.shift(4)) &
+        (close.shift(4) > close.shift(5))
+    )
+    setup_b = (
+        (close > vwap + 2.5 * atr14) &
+        consecutive_green &
+        (volume_ratio > 2.0) &
+        vol_ok
+    )
 
     # Diagnostic: per-condition pass rates
     n_total = int((~df["ATR"].isna()).sum())
@@ -130,27 +140,13 @@ def filter_events(df: pd.DataFrame) -> pd.DataFrame:
     logger.info(f"    EMA20_slope>0               : {(ema20_slope > 0).sum():>8,}")
     logger.info(f"    vol_ok                      : {vol_ok.sum():>8,}")
     logger.info(f"    LONG momentum (all)         : {setup_a.sum():>8,}")
-    logger.info(f"    trend_dn  (EMA5 < EMA20)    : {trend_dn.sum():>8,}  ({trend_dn.sum()/max(n_total,1)*100:.1f}%)")
-    logger.info(f"    below_vwap (close < VWAP)   : {below_vwap.sum():>8,}  ({below_vwap.sum()/max(n_total,1)*100:.1f}%)")
-    logger.info(f"    lose      (EMA cross down)   : {lose.sum():>8,}  ({lose.sum()/max(n_total,1)*100:.2f}%)")
-    logger.info(f"    vol_ok    (ATR > 0.5*ATR50)  : {vol_ok.sum():>8,}  ({vol_ok.sum()/max(n_total,1)*100:.1f}%)")
-
-    # Mutual exclusion
-    both = setup_a & setup_b_ema20
-    if both.any():
-        logger.info(f"Skipping {both.sum()} ambiguous bars (both setups fire simultaneously)")
-    setup_a = setup_a & ~both
-    setup_b_ema20 = setup_b_ema20 & ~both
-    setup_b_vwap = setup_b_vwap & ~both
+    logger.info(f"    SHORT exhaustion (all)       : {setup_b.sum():>8,}")
 
     # Mark events (filter by --side in main())
     df["side"] = 0
-
-    # Filter to event rows only
-    drop_cols = ["TPV", "Cum_TPV", "Cum_Vol"]
+    drop_cols = ["TPV", "Cum_TPV", "Cum_Vol"]  # keep volume_ratio for exhaustion
     df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
-
-    return df, setup_a, setup_b_vwap, setup_b_ema20, len(df)
+    return df, setup_a, setup_b, len(df)
 
 
 def main():
@@ -172,22 +168,30 @@ def main():
     df = df.dropna(subset=["ATR", "EMA5", "EMA20", "VWAP", "RSI"]).reset_index(drop=True)
     logger.info(f"After indicator dropna: {len(df):,} rows")
 
-    df, setup_a, setup_b_vwap, setup_b_ema20, n_total = filter_events(df)
+    df, setup_a, setup_b, n_total = filter_events(df)
+
+    # Mutual exclusion only for --side both
+    if args.side == "both":
+        both = setup_a & setup_b
+        if both.any():
+            logger.info(f"Skipping {both.sum()} ambiguous bars (mutual exclusion)")
+            setup_a = setup_a & ~both
+            setup_b = setup_b & ~both
 
     if args.side == "long":
         df.loc[setup_a.fillna(False), "side"] = 1
         events = df[df["side"] != 0].copy()
         logger.info(f"Setup A (Long) events:     {len(events):>8,}")
     elif args.side == "short":
-        df.loc[setup_b_ema20.fillna(False), "side"] = -1
+        df.loc[setup_b.fillna(False), "side"] = -1
         events = df[df["side"] != 0].copy()
-        logger.info(f"Setup B (Short, EMA20) events: {len(events):>8,}")
+        logger.info(f"Setup B (Short, Exhaustion) events: {len(events):>8,}")
     else:
         df.loc[setup_a.fillna(False), "side"] = 1
-        df.loc[setup_b_ema20.fillna(False), "side"] = -1
+        df.loc[setup_b.fillna(False), "side"] = -1
         events = df[df["side"] != 0].copy()
         logger.info(f"Setup A (Long) events:     {setup_a.sum():>8,}")
-        logger.info(f"Setup B (Short, EMA20) events: {setup_b_ema20.sum():>8,}")
+        logger.info(f"Setup B (Short) events:    {setup_b.sum():>8,}")
         logger.info(f"Total events:              {len(events):>8,} out of {n_total:,} bars ({len(events)/max(n_total,1)*100:.2f}%)")
 
     if len(events) == 0:
