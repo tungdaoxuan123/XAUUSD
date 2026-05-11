@@ -107,7 +107,7 @@ async def run_process(script_path: str, args: List[str]):
             line = await current_process.stdout.readline()
             if not line:
                 break
-            await broadcast_log(line.decode().rstrip())
+            await broadcast_log(line.decode(errors='replace').rstrip())
             
         await current_process.wait()
         await broadcast_log(f"--- Process finished with exit code {current_process.returncode} ---")
