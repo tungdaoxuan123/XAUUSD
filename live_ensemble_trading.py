@@ -20,7 +20,7 @@ import logging
 import os
 import time
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -129,6 +129,7 @@ class LiveEnsembleTrader:
         self._zscore_win = 500  # overridden by model metadata at predict time
         for k in ["atr_norm", "kyle_lambda", "vprof_poc_dist", "ofi_window", "tick_imbalance"]:
             self._zscore_bufs[k] = []
+        self.bar_counter = 0
 
     def _zscore(self, key: str, raw_val: float, win: int = None) -> float:
         w = win or self._zscore_win
@@ -221,7 +222,7 @@ class LiveEnsembleTrader:
         feat["above_ema200"] = 1.0 if close[i] > ema200[i] else 0.0
 
         # Return lags (ATR-normalized, clipped)
-        for k in range(15):
+        for k in range(60):
             lag_i = i - (k + 1)
             if lag_i >= 0 and atr[lag_i] > 0:
                 feat[f"return_lag_{k}"] = np.clip((close[i] - close[lag_i]) / (atr[lag_i] + 1e-9), -10, 10)
@@ -240,6 +241,21 @@ class LiveEnsembleTrader:
             logger.error("MT5 init failed"); return
         self.risk_mgr.initialize_balance()
 
+        # Pre-warm z-score buffers on startup
+        logger.info("Fetching historical data to warm up Z-score buffers...")
+        warmup_rates = self.interface.get_rates(count=600)
+        if warmup_rates is not None and len(warmup_rates) > 0:
+            warmup_df = pd.DataFrame(warmup_rates)
+            warmup_df = self._compute_indicators(warmup_df)
+            for i in range(len(warmup_df)):
+                feat = self._compute_live_features(warmup_df.iloc[:i+1])
+                if feat:
+                    for zk in ["atr_norm", "kyle_lambda", "vprof_poc_dist", "ofi_window", "tick_imbalance"]:
+                        self._zscore(zk, feat.get(zk, 0.0))
+            logger.info("Z-score buffers warmed up successfully.")
+        else:
+            logger.warning("Could not fetch warmup rates. Z-score buffers will start empty.")
+
         last_update = datetime.now() - timedelta(seconds=interval_s)
         try:
             while True:
@@ -247,11 +263,16 @@ class LiveEnsembleTrader:
                 if (now - last_update).total_seconds() < interval_s:
                     time.sleep(1); continue
                 last_update = now
+                self.bar_counter += 1
 
-                # Skip if position open
-                positions = self.interface.get_positions()
-                if positions and len(positions) > 0:
-                    continue
+                # Check positions per-side (hedging allowed)
+                positions = self.interface.get_positions() or []
+                has_long = any(p.type == 0 for p in positions)
+                has_short = any(p.type == 1 for p in positions)
+                if has_long and has_short:
+                    continue  # both sides active, no new entries
+                if self.bar_counter % 12 == 0 and len(positions) > 0:
+                    logger.info(f"Positions open — long={has_long} short={has_short}, new entries blocked per-side")
 
                 if not self.risk_mgr.can_trade():
                     time.sleep(10); continue
@@ -268,32 +289,36 @@ class LiveEnsembleTrader:
                 atr = df["ATR"].iloc[-1]
                 current_price = df["close"].iloc[-1]
 
-                # Check both setups
-                for model, side, condition in [
-                    (self.long_model, 1, self._check_setup(df, 1)),
-                    (self.short_model, -1, self._check_setup(df, -1)),
-                ]:
-                    if model is None or not condition:
+                # Always compute features and predict every 10s for visibility
+                for model, side in [(self.long_model, 1), (self.short_model, -1)]:
+                    if model is None:
                         continue
 
                     feat = self._compute_live_features(df)
                     if feat is None:
                         continue
 
+                    setup_fired = self._check_setup(df, side)
+
                     # Apply rolling z-score with model-specific window
                     for zk in ["atr_norm", "kyle_lambda", "vprof_poc_dist", "ofi_window", "tick_imbalance"]:
                         feat[zk] = self._zscore(zk, feat.get(zk, 0.0), win=model.zscore_window)
 
-                    # Build feature vector in model's expected order
                     f_list = [feat.get(f, 0.0) for f in model.features]
                     X = np.array(f_list, dtype=np.float32)
-
                     p_raw, p_cal = model.predict_calibrated(X)
-                    side_label = "LONG" if side > 0 else "SHORT"
-                    logger.info(f"Setup {side_label}: raw={p_raw:.3f} cal={p_cal:.3f} (thresh={model.threshold:.2f})")
 
-                    if p_cal < 0.45:
-                        logger.info(f"Skip {side_label}: cal={p_cal:.3f} < 0.45")
+                    side_label = "LONG" if side > 0 else "SHORT"
+                    tag = "Setup" if setup_fired else "Scan"
+                    logger.info(f"{tag} {side_label}: raw={p_raw:.3f} cal={p_cal:.3f} (thresh={model.threshold:.2f})")
+
+                    if p_cal < model.threshold:
+                        logger.info(f"Skip {side_label}: cal={p_cal:.3f} < {model.threshold:.2f}")
+                        continue
+
+                    # Per-side position gate (predictions still log, but orders blocked)
+                    if (side > 0 and has_long) or (side < 0 and has_short):
+                        logger.info(f"Block {side_label}: position already open")
                         continue
 
                     # Place order: SL = close -/+ 1*ATR, TP = close +/- 2*ATR
@@ -334,7 +359,7 @@ def main():
     ap.add_argument("--interval", type=int, default=10)
     args = ap.parse_args()
 
-    long_dir = args.long_model or "train_pipeline/models_gpu_long_lb15_momentum"
+    long_dir = args.long_model or "train_pipeline/models_gpu_long_lb10_momentum"
     short_dir = args.short_model or "train_pipeline/models_gpu_short_lb60"
 
     if not os.path.exists(long_dir):
