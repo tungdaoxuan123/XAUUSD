@@ -6,12 +6,12 @@ class VotingEngine:
     def __init__(self):
         # Weight Table [Bull, Bear, Ranging]
         self.weights = {
-            "EMA_MACD_TREND": {"BULL_TREND": 1.5, "BEAR_TREND": 1.5, "RANGING": 0.5, "VOLATILE": 0.0, "UNKNOWN": 1.0},
+            "EMA_MACD_TREND": {"BULL_TREND": 1.5, "BEAR_TREND": 1.5, "RANGING": 0.5, "VOLATILE": 1.5, "UNKNOWN": 1.0},
             "BB_SQUEEZE": {"BULL_TREND": 1.0, "BEAR_TREND": 1.0, "RANGING": 0.8, "VOLATILE": 0.5, "UNKNOWN": 1.0},
             "ICT_OB": {"BULL_TREND": 1.8, "BEAR_TREND": 1.8, "RANGING": 1.2, "VOLATILE": 0.5, "UNKNOWN": 1.0},
             "RSI_DIV": {"BULL_TREND": 0.8, "BEAR_TREND": 0.8, "RANGING": 1.5, "VOLATILE": 0.5, "UNKNOWN": 1.0},
-            "EXHAUSTION_SHORT": {"BULL_TREND": 1.5, "BEAR_TREND": 2.0, "RANGING": 0.5, "VOLATILE": 1.0, "UNKNOWN": 1.0},
-            "VWAP_REVERSION": {"BULL_TREND": 2.0, "BEAR_TREND": 0.0, "RANGING": 1.2, "VOLATILE": 0.0, "UNKNOWN": 1.0}
+            "EXHAUSTION_SHORT": {"BULL_TREND": 1.5, "BEAR_TREND": 2.0, "RANGING": 0.5, "VOLATILE": 1.5, "UNKNOWN": 1.0},
+            "VWAP_REVERSION": {"BULL_TREND": 2.0, "BEAR_TREND": 0.0, "RANGING": 1.2, "VOLATILE": 1.0, "UNKNOWN": 1.0}
         }
         from config.settings import THRESHOLDS
         self.thresholds = THRESHOLDS

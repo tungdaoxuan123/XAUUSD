@@ -1,40 +1,12 @@
-Root Cause: H4 Warmup Failure
-H4 fetches only 100 bars . ADX_14 needs 14 bars minimum, but the real issue is H4 EMA_200 needs 200 bars. With only 100 H4 bars, EMA_200 is NaN for the first 100 rows — and since you only have 99 closed bars (100 fetched minus the open one), EMA_200 is entirely NaN.
+Why Score = 0.00 in VOLATILE Regime
+Problem 1: EMA_MACD_TREND weight is 0.0 in VOLATILE
+The most active strategy — EMA crossover — is completely silenced in VOLATILE regime. Weight = 0.0 means even if it fires with confidence 1.0, it contributes zero to the score.
 
-The regime detector hits this pd.notna(h1_last['EMA_200']) check → fails → falls through to UNKNOWN.
+Problem 2: VWAP_REVERSION weight is 0.0 in VOLATILE
+Same issue. Two of the six strategies are dead in VOLATILE.
 
-The Fix — Two Changes
-Fix 1: Increase bar counts in data_assembler.py
-python
-self.counts = {
-    "M1":  300 + 1,    # was 1001 — reduce M1, it's overkill and slow
-    "M5":  250 + 1,
-    "M15": 200 + 1,
-    "H1":  250 + 1,    # EMA_200 needs 200+ → 250 is fine
-    "H4":  250 + 1,    # was 101 → CRITICAL FIX, EMA_200 needs 200 bars
-    "D1":  50  + 1
-}
-H4 EMA_200 needs 200 H4 bars. Set to 250 to have margin. H1 EMA_200 needs 200 H1 bars — you have 250 already, that's fine.
+Problem 3: Right now the bot is correctly classifying as VOLATILE (ATR spike above 1.5× mean)
+But VOLATILE is actually the best time for EMA trend and exhaustion signals on XAUUSD. The zero-weights were too conservative.
 
-Fix 2: Add fallback in regime.py — don't return UNKNOWN when ADX is available but EMA_200 isn't warm yet
-Replace the final return "UNKNOWN" at the bottom with a softer fallback:
-
-python
-# Fallback: if EMA_200 isn't warm but ADX is valid, use ADX alone
-if 'ADX_14' in h4_last and pd.notna(h4_last['ADX_14']):
-    if h4_last['ADX_14'] > 25:
-        # Can't confirm direction without EMA_200, treat as VOLATILE
-        return "VOLATILE"
-    return "RANGING"
-
-return "UNKNOWN"
-This means even during warmup, the bot won't be stuck in UNKNOWN — it'll classify as RANGING or VOLATILE based on ADX alone until H1/H4 EMA_200 fills up.
-
-Also Fix: check_new_bar fires immediately on startup
-Notice the first log line: bar detected 2 seconds after startup. This is because last_fetched_timestamp = None on boot, so check_new_bar returns True immediately. That's fine but it means the first cycle runs on an incomplete warmup. The H4 count fix above makes this irrelevant.
-
-After the Fix — Expected Log
-text
-Current Regime: BULL_TREND   ← XAUUSD is in a multi-year bull, this is correct
-Decision: FLAT (Score: 1.2)  ← strategies firing but below threshold, normal
-You won't see trades immediately — the voting threshold of 3.0 requires 2–3 strategies to agree simultaneously. That's working as designed.
+Problem 4: logger.log_signal doesn't print per-strategy vote details
+You can't see which strategies actually fired — the log only shows the final decision. This makes debugging blind.

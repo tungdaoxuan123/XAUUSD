@@ -15,6 +15,7 @@ from core.risk import RiskManager
 from core.position_monitor import PositionMonitor
 from core.logger import TradeLogger
 from config.settings import SYMBOL
+from utils.session import SessionManager
 
 class BotOrchestrator:
     def __init__(self):
@@ -89,6 +90,12 @@ class BotOrchestrator:
                 decision = ml_gate(decision, None)
                 
                 self.logger.log_signal(regime, votes, decision, final_score)
+                
+                # Console log for active votes
+                for v in votes:
+                    if v.side != "FLAT":
+                        self.logger.info(f"  -> {v.strategy_id} voted {v.side} (Conf: {v.confidence:.2f})")
+                        
                 self.logger.info(f"Decision: {decision} (Score: {final_score:.2f})")
                 
                 # 7. Order Execution
@@ -122,7 +129,8 @@ class BotOrchestrator:
         sl, tp1, tp2 = self.risk_manager.calculate_levels(decision, entry_price, atr)
         
         # Max confidence from the winning side
-        confidence = min(1.0, score / 4.0) # rough proxy
+        max_score = self.voting_engine.get_max_score(regime)
+        confidence = min(1.0, score / max_score) if max_score > 0 else 0.5
         
         volume = self.risk_manager.calculate_position_size(equity, entry_price, sl, regime, confidence)
         
