@@ -1,104 +1,31 @@
-This plan is excellent and production-ready as written. A few targeted observations before you hand it to the coding agent:
-
-What's Solid ✅
-Bottom-up phasing is the right call. Verifying MTF data integrity against the live terminal before writing a single strategy line will save enormous debugging time later.
-
-v3_trade/ isolation is clean — the existing train_pipeline/ is completely safe.
-
-The "no open bar" enforcement in data_assembler.py is explicitly called out, which is critical. Many live bots fail because they act on an incomplete forming bar.
-
-Demo account verification in Phase 5 is the correct final gate.
-
-Gaps to Close Before Handing to the Coding Agent
-1. config/settings.py is mentioned but not in the directory tree
-
-Add it explicitly:
-
-text
-v3_trade/
-├── config/
-│   └── settings.py   # symbol, timeframes, risk%, session windows, thresholds
-This file should be the single source of truth for all tunable parameters. The coding agent should never hardcode "XAUUSD", 0.01, or 60 anywhere in the logic files.
-
-2. core/main_loop.py is missing from the directory tree
-
-It appears in Phase 5's description but not in the tree. Add it:
-
-text
-├── core/
-│   ├── voting.py
-│   ├── risk.py
-│   ├── main_loop.py    # orchestrator
-│   └── logger.py       # structured per-signal and per-trade logging
-logger.py should also be explicitly listed — without it, Phase 5 demo verification has no audit trail.
-
-3. Economic calendar has no home
-
-The architecture document specifies a pre-loaded weekly calendar for news blocking. Add:
-
-text
-├── utils/
-│   ├── calendar.py     # news event loader and pre-trade gate check
-│   └── session.py      # session window detection (Asian/London/NY)
-4. Phase 3 unit tests need a tests/ directory
-
-text
-├── tests/
-│   ├── test_strategies.py
-│   ├── test_voting.py
-│   └── test_risk.py
-If you don't specify this, the coding agent will skip it or inline the tests, which breaks CI later.
-
-5. Position monitor is missing from Phase 5
-
-The architecture specifies trailing stop activation after TP1 hit and partial close logic. This is non-trivial and needs its own module:
-
-text
-├── core/
-│   └── position_monitor.py  # trailing stop, TP1 partial close, breakeven logic
-Currently Phase 5 only mentions order_send. The position monitor loop (which polls open positions every 30s) is a separate concern from the entry main loop and needs to be scoped explicitly.
-
-One Risk to Flag
-The plan defers the ML layer entirely, which is fine. But tell the coding agent to reserve the ML hook explicitly in core/voting.py as a passthrough stub:
+Issues & Gaps to Fix
+🔴 Critical
+1. EXHAUSTION_SHORT weight in BULL_TREND is 0.0
+This means the exhaustion short can never fire in a bull trend — but blow-off tops happen during bull trends. This is the exact scenario you want to catch. Change this:
 
 python
-# ml_filter is None until Part 6 is implemented
-def ml_gate(signal, ml_filter=None):
-    if ml_filter is None:
-        return signal  # pass-through
-    return ml_filter.evaluate(signal)
-If this stub isn't placed now, retrofitting the ML layer into the voting engine later will require refactoring the core decision path — which is risky on a live bot.
+"EXHAUSTION_SHORT": {"BULL_TREND": 1.5, ...}  # was 0.0
+Exhaustion shorts are most valid in BULL_TREND and VOLATILE — zero-weighting them there defeats the purpose.
 
-Recommended Final Directory Tree
-text
-v3_trade/
-├── config/
-│   └── settings.py
-├── bridge/
-│   ├── mt5_bridge.py
-│   └── data_assembler.py
-├── indicators/
-│   ├── engine.py
-│   └── regime.py
-├── strategies/
-│   ├── base.py
-│   ├── ema_macd.py
-│   ├── bb_squeeze.py
-│   ├── ict_ob.py
-│   ├── rsi_div.py
-│   ├── exhaustion.py
-│   └── vwap_reversion.py
-├── core/
-│   ├── voting.py
-│   ├── risk.py
-│   ├── position_monitor.py
-│   ├── main_loop.py
-│   └── logger.py
-├── utils/
-│   ├── calendar.py
-│   └── session.py
-└── tests/
-    ├── test_strategies.py
-    ├── test_voting.py
-    └── test_risk.py
-With those additions, the plan is complete and fully ready for implementation. The phasing is correct, the bottom-up verification approach is sound, and the MT5 hybrid architecture is the right call for integrating the future ML layer cleanly. Hand it to your coding agent as-is with the directory tree above replacing the original.
+2. ATR uses simple rolling mean, not Wilder's
+Standard ATR uses Wilder's smoothing (EMA with alpha=1/period). The current rolling(p).mean() gives different values. For XAUUSD, the difference matters for SL/TP calculation. Fix:
+
+python
+df[f'ATR_{p}'] = true_range.ewm(alpha=1/p, adjust=False).mean()
+🟡 Medium
+3. confidence in execute_trade is a rough proxy
+
+python
+confidence = min(1.0, score / 4.0)
+This caps at 1.0 when score=4.0 but a typical max score is 7–8 (6 strategies × weighted vote). The denominator should be closer to max_possible_score per regime. Consider passing final_score / self.voting_engine.max_score(regime) instead.
+
+4. add_swing_points uses center=True rolling
+This introduces look-ahead bias in live trading. In backtesting it's fine, but center=True means the swing point uses future bars. In live operation, shift(lookback) corrects for it, but verify this shift is consistent when len(df) is near the window boundary.
+
+5. No session filter visible
+The theory doc called for blocking trades during low-liquidity windows (00:00–02:00 UTC, 22:00–24:00 UTC). No session gate is visible in main_loop.py. Add a check before execute_trade.
+
+🟢 Minor
+6. ml_gate stub — correctly pass-through for now, but wire up when LightGBM model is ready.
+
+7. D1 WEEKLY_OPEN uses ffill() — correct pattern, but verify ffill() fills correctly when the weekly open bar hasn't appeared yet (start of dataset edge case).

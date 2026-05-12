@@ -93,7 +93,10 @@ class BotOrchestrator:
                 
                 # 7. Order Execution
                 if decision in ["LONG", "SHORT"]:
-                    self.execute_trade(decision, data_dict['M1'].iloc[-1], final_score, regime)
+                    if SessionManager.is_trading_allowed():
+                        self.execute_trade(decision, data_dict['M1'].iloc[-1], final_score, regime)
+                    else:
+                        self.logger.info(f"Trade blocked by session gate (Low liquidity window).")
                 
                 last_fetched_timestamp = expected_close
                 

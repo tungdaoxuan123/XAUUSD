@@ -10,11 +10,14 @@ class VotingEngine:
             "BB_SQUEEZE": {"BULL_TREND": 1.0, "BEAR_TREND": 1.0, "RANGING": 0.8, "VOLATILE": 0.5, "UNKNOWN": 1.0},
             "ICT_OB": {"BULL_TREND": 1.8, "BEAR_TREND": 1.8, "RANGING": 1.2, "VOLATILE": 0.5, "UNKNOWN": 1.0},
             "RSI_DIV": {"BULL_TREND": 0.8, "BEAR_TREND": 0.8, "RANGING": 1.5, "VOLATILE": 0.5, "UNKNOWN": 1.0},
-            "EXHAUSTION_SHORT": {"BULL_TREND": 0.0, "BEAR_TREND": 2.0, "RANGING": 0.5, "VOLATILE": 1.0, "UNKNOWN": 1.0},
+            "EXHAUSTION_SHORT": {"BULL_TREND": 1.5, "BEAR_TREND": 2.0, "RANGING": 0.5, "VOLATILE": 1.0, "UNKNOWN": 1.0},
             "VWAP_REVERSION": {"BULL_TREND": 2.0, "BEAR_TREND": 0.0, "RANGING": 1.2, "VOLATILE": 0.0, "UNKNOWN": 1.0}
         }
         from config.settings import THRESHOLDS
         self.thresholds = THRESHOLDS
+
+    def get_max_score(self, current_regime: str) -> float:
+        return sum(w.get(current_regime, 1.0) for w in self.weights.values())
 
     def aggregate(self, votes: List[Vote], current_regime: str):
         long_score = 0.0

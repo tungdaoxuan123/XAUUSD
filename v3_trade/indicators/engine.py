@@ -16,7 +16,7 @@ class IndicatorEngine:
         ranges = pd.concat([high_low, high_close, low_close], axis=1)
         true_range = np.max(ranges, axis=1)
         for p in periods:
-            df[f'ATR_{p}'] = true_range.rolling(p).mean() # Simple rolling mean for ATR
+            df[f'ATR_{p}'] = true_range.ewm(alpha=1/p, adjust=False).mean()
         return df
 
     @staticmethod
@@ -165,7 +165,7 @@ class IndicatorEngine:
             df['day_of_week'] = df.index.dayofweek
             
         df['IS_MONDAY'] = df['day_of_week'] == 0
-        df['WEEKLY_OPEN'] = df['open'].where(df['IS_MONDAY']).ffill()
+        df['WEEKLY_OPEN'] = df['open'].where(df['IS_MONDAY']).ffill().bfill()
         
         return df
 
