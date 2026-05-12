@@ -45,8 +45,11 @@ class RegimeDetector:
                 if h1_last['close'] < h1_last['EMA_200'] and h1_last['EMA_50_SLOPE'] < 0 and adx_strong:
                     return "BEAR_TREND"
                 
-        # If it doesn't clearly match trend or tight range, but adx is low
-        if 'ADX_14' in h4_last and pd.notna(h4_last['ADX_14']) and h4_last['ADX_14'] < 20:
+        # Fallback: if EMA_200 isn't warm but ADX is valid, use ADX alone
+        if 'ADX_14' in h4_last and pd.notna(h4_last['ADX_14']):
+            if h4_last['ADX_14'] > 25:
+                # Can't confirm direction without EMA_200, treat as VOLATILE
+                return "VOLATILE"
             return "RANGING"
             
         return "UNKNOWN"

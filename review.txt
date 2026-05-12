@@ -1,31 +1,40 @@
-Issues & Gaps to Fix
-🔴 Critical
-1. EXHAUSTION_SHORT weight in BULL_TREND is 0.0
-This means the exhaustion short can never fire in a bull trend — but blow-off tops happen during bull trends. This is the exact scenario you want to catch. Change this:
+Root Cause: H4 Warmup Failure
+H4 fetches only 100 bars . ADX_14 needs 14 bars minimum, but the real issue is H4 EMA_200 needs 200 bars. With only 100 H4 bars, EMA_200 is NaN for the first 100 rows — and since you only have 99 closed bars (100 fetched minus the open one), EMA_200 is entirely NaN.
+
+The regime detector hits this pd.notna(h1_last['EMA_200']) check → fails → falls through to UNKNOWN.
+
+The Fix — Two Changes
+Fix 1: Increase bar counts in data_assembler.py
+python
+self.counts = {
+    "M1":  300 + 1,    # was 1001 — reduce M1, it's overkill and slow
+    "M5":  250 + 1,
+    "M15": 200 + 1,
+    "H1":  250 + 1,    # EMA_200 needs 200+ → 250 is fine
+    "H4":  250 + 1,    # was 101 → CRITICAL FIX, EMA_200 needs 200 bars
+    "D1":  50  + 1
+}
+H4 EMA_200 needs 200 H4 bars. Set to 250 to have margin. H1 EMA_200 needs 200 H1 bars — you have 250 already, that's fine.
+
+Fix 2: Add fallback in regime.py — don't return UNKNOWN when ADX is available but EMA_200 isn't warm yet
+Replace the final return "UNKNOWN" at the bottom with a softer fallback:
 
 python
-"EXHAUSTION_SHORT": {"BULL_TREND": 1.5, ...}  # was 0.0
-Exhaustion shorts are most valid in BULL_TREND and VOLATILE — zero-weighting them there defeats the purpose.
+# Fallback: if EMA_200 isn't warm but ADX is valid, use ADX alone
+if 'ADX_14' in h4_last and pd.notna(h4_last['ADX_14']):
+    if h4_last['ADX_14'] > 25:
+        # Can't confirm direction without EMA_200, treat as VOLATILE
+        return "VOLATILE"
+    return "RANGING"
 
-2. ATR uses simple rolling mean, not Wilder's
-Standard ATR uses Wilder's smoothing (EMA with alpha=1/period). The current rolling(p).mean() gives different values. For XAUUSD, the difference matters for SL/TP calculation. Fix:
+return "UNKNOWN"
+This means even during warmup, the bot won't be stuck in UNKNOWN — it'll classify as RANGING or VOLATILE based on ADX alone until H1/H4 EMA_200 fills up.
 
-python
-df[f'ATR_{p}'] = true_range.ewm(alpha=1/p, adjust=False).mean()
-🟡 Medium
-3. confidence in execute_trade is a rough proxy
+Also Fix: check_new_bar fires immediately on startup
+Notice the first log line: bar detected 2 seconds after startup. This is because last_fetched_timestamp = None on boot, so check_new_bar returns True immediately. That's fine but it means the first cycle runs on an incomplete warmup. The H4 count fix above makes this irrelevant.
 
-python
-confidence = min(1.0, score / 4.0)
-This caps at 1.0 when score=4.0 but a typical max score is 7–8 (6 strategies × weighted vote). The denominator should be closer to max_possible_score per regime. Consider passing final_score / self.voting_engine.max_score(regime) instead.
-
-4. add_swing_points uses center=True rolling
-This introduces look-ahead bias in live trading. In backtesting it's fine, but center=True means the swing point uses future bars. In live operation, shift(lookback) corrects for it, but verify this shift is consistent when len(df) is near the window boundary.
-
-5. No session filter visible
-The theory doc called for blocking trades during low-liquidity windows (00:00–02:00 UTC, 22:00–24:00 UTC). No session gate is visible in main_loop.py. Add a check before execute_trade.
-
-🟢 Minor
-6. ml_gate stub — correctly pass-through for now, but wire up when LightGBM model is ready.
-
-7. D1 WEEKLY_OPEN uses ffill() — correct pattern, but verify ffill() fills correctly when the weekly open bar hasn't appeared yet (start of dataset edge case).
+After the Fix — Expected Log
+text
+Current Regime: BULL_TREND   ← XAUUSD is in a multi-year bull, this is correct
+Decision: FLAT (Score: 1.2)  ← strategies firing but below threshold, normal
+You won't see trades immediately — the voting threshold of 3.0 requires 2–3 strategies to agree simultaneously. That's working as designed.

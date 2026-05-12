@@ -9,11 +9,11 @@ class DataAssembler:
         self.timeframes = ["M1", "M5", "M15", "H1", "H4", "D1"]
         # Fetch an extra bar so we can safely drop the open/forming bar
         self.counts = {
-            "M1": 1000 + 1,
+            "M1": 300 + 1,
             "M5": 250 + 1,
             "M15": 200 + 1,
             "H1": 250 + 1,
-            "H4": 100 + 1,
+            "H4": 250 + 1,
             "D1": 50 + 1
         }
         
