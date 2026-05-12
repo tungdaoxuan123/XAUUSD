@@ -69,6 +69,20 @@ class FTMORiskManager:
 
         return True
 
+    def is_daily_drawdown_exceeded(self, threshold: float = -0.02):
+        """Checks if the account equity has dropped by the threshold pct since day start."""
+        account_info = self.interface.get_account_info()
+        if not account_info:
+            return False
+            
+        current_equity = account_info.equity
+        # threshold is negative, e.g., -0.02 for 2% drop
+        drawdown_pct = (current_equity - self.day_start_balance) / self.day_start_balance if self.day_start_balance > 0 else 0
+        
+        if drawdown_pct <= threshold:
+            return True
+        return False
+
     def calculate_position_size(self, confidence, stop_distance_points):
         """
         Calculates lot size based on fixed $5 risk ($10,000 * 0.05%)
