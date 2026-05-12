@@ -3,13 +3,16 @@ live_ensemble_trading.py — Meta-Labeling v3 Live Bot
 =====================================================
 
 Event-based execution with calibrated dual-model dispatch.
-Supports long, short, or both simultaneously.
+Supports long, short, or both simultaneously (hedging).
 
 On each bar:
-  1. Check Setup A (long) and Setup B (short) primary signal conditions
-  2. If condition fires -> compute features -> model predict -> calibrate
-  3. If calibrated p >= threshold -> place order (2:1 TP/SL via ATR)
-  4. Block signals while position open
+  1. Manage open positions (time stop, BE+partial, chandelier, confidence decay)
+  2. Check hedge-aware exits when both sides active
+  3. Check macro exits (volatility, session, drawdown, news)
+  4. Check Setup A (long) and Setup B (short) primary signal conditions
+  5. If condition fires -> compute features -> model predict -> calibrate
+  6. If calibrated p >= threshold -> place order (2:1 TP/SL via ATR)
+  7. Respect cooldowns after closes
 """
 
 from __future__ import annotations
@@ -17,19 +20,29 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import time
-from datetime import datetime, timedelta
-from typing import Dict, Optional
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
 from config import Settings, setup_logging
 from mt5_interface import MT5Interface
+from news_manager import NewsManager
 from risk_manager import FTMORiskManager
 
 from sklearn.base import BaseEstimator, ClassifierMixin
+
+logger = setup_logging()
+
+
+# ---------------------------------------------------------------------------
+# CalibratedWrapper — required for unpickling calibrators
+# ---------------------------------------------------------------------------
 
 class CalibratedWrapper(BaseEstimator, ClassifierMixin):
     def __init__(self, base_model=None, backend=""):
@@ -49,8 +62,28 @@ class CalibratedWrapper(BaseEstimator, ClassifierMixin):
         p = np.ones(len(X)) * 0.5
         return np.column_stack([1 - p, p])
 
-logger = setup_logging()
 
+# ---------------------------------------------------------------------------
+# PositionTracker — metadata per open position
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PositionTracker:
+    ticket: int
+    side: int                # +1 long, -1 short
+    entry_price: float
+    sl: float
+    tp: float
+    entry_bar: int
+    entry_time: datetime
+    best_price: float        # best price seen since entry
+    highest_r: float = 0.0   # highest R-multiple reached
+    partial_closed: bool = False
+
+
+# ---------------------------------------------------------------------------
+# DirectionModel
+# ---------------------------------------------------------------------------
 
 class DirectionModel:
     """Loads a single trained model + calibrator + metadata."""
@@ -110,7 +143,7 @@ class DirectionModel:
 
 
 class LiveEnsembleTrader:
-    """Dual-model live bot with primary signal filter + calibration."""
+    """Dual-model live bot with hedging + multi-layer exit strategy."""
 
     def __init__(self, long_dir: str = None, short_dir: str = None):
         self.settings = Settings
@@ -126,10 +159,17 @@ class LiveEnsembleTrader:
 
         # Rolling z-score buffers for regime-agnostic features
         self._zscore_bufs: Dict[str, list] = {}
-        self._zscore_win = 500  # overridden by model metadata at predict time
+        self._zscore_win = 500
         for k in ["atr_norm", "kyle_lambda", "vprof_poc_dist", "ofi_window", "tick_imbalance"]:
             self._zscore_bufs[k] = []
         self.bar_counter = 0
+
+        # Position tracking
+        self._trackers: Dict[int, PositionTracker] = {}
+
+        # Cooldowns
+        self._flip_cooldown_bar = -100  # 3-bar cooldown after directional flip
+        self._reentry_cooldowns: List[tuple] = []  # [(bar, side), ...] 10-bar cooldown
 
     def _zscore(self, key: str, raw_val: float, win: int = None) -> float:
         w = win or self._zscore_win
@@ -235,6 +275,148 @@ class LiveEnsembleTrader:
 
         return feat
 
+    def _add_reentry_cooldown(self, side: int):
+        self._reentry_cooldowns.append((self.bar_counter, side))
+
+    def _get_volume(self, ticket: int) -> float:
+        try:
+            pos = next(p for p in (self.interface.get_positions() or []) if p.ticket == ticket)
+            return float(pos.volume)
+        except (StopIteration, AttributeError):
+            return 0.0
+
+    def _manage_positions(self, positions, df, dry_run: bool):
+        """Multi-layer exit strategy. Called every bar with open positions."""
+        atr_val = float(df["ATR"].iloc[-1]) if "ATR" in df.columns else 0.0
+        close_val = float(df["close"].iloc[-1])
+
+        # Sync trackers
+        active_tickets = [p.ticket for p in positions]
+        for tid in list(self._trackers.keys()):
+            if tid not in active_tickets:
+                del self._trackers[tid]
+
+        now_utc = datetime.now(timezone.utc)
+        hour = now_utc.hour; minute = now_utc.minute; weekday = now_utc.weekday()
+
+        for p in positions:
+            tid = p.ticket
+            if tid not in self._trackers:
+                self._trackers[tid] = PositionTracker(
+                    ticket=tid, side=+1 if p.type == 0 else -1,
+                    entry_price=float(p.price_open), sl=float(p.sl), tp=float(p.tp),
+                    entry_bar=self.bar_counter, entry_time=datetime.now(),
+                    best_price=float(p.price_open))
+            tr = self._trackers[tid]
+
+            # --- Macro: Volatility Spike ---
+            atr50 = np.nanmean(df["ATR"].iloc[-50:].values) if len(df) >= 50 else 0
+            if atr50 > 0 and atr_val > 3 * atr50:
+                logger.warning(f"Vol spike: ATR={atr_val:.2f} > 3x ATR50={atr50:.2f} — closing ALL")
+                if not dry_run: self.interface.close_all_positions()
+                self._trackers.clear(); return
+
+            # --- Macro: Session close (NY close 21 UTC / Fri 21 UTC) ---
+            is_eod = (hour >= 20 and minute >= 55) or (weekday == 4 and hour >= 21)
+            if is_eod:
+                logger.info(f"EOD close {tid}: {tr.highest_r:.2f}R")
+                if not dry_run: self.interface.close_position(tid)
+                self._add_reentry_cooldown(tr.side)
+                self._trackers.pop(tid, None); continue
+
+            # --- Calculate R ---
+            sl_dist = max(abs(tr.entry_price - tr.sl), 1e-9)
+            if tr.side > 0:
+                r = (close_val - tr.entry_price) / sl_dist
+                tr.best_price = max(tr.best_price, close_val)
+            else:
+                r = (tr.entry_price - close_val) / sl_dist
+                tr.best_price = min(tr.best_price, close_val)
+            tr.highest_r = max(tr.highest_r, r)
+
+            # --- Time Stop (60 bars) ---
+            if self.bar_counter - tr.entry_bar >= 60:
+                logger.info(f"Time stop {tid}: {r:.2f}R")
+                if not dry_run: self.interface.close_position(tid)
+                self._add_reentry_cooldown(tr.side)
+                self._trackers.pop(tid, None); continue
+
+            # --- BE + Partial Close at +1R ---
+            if r >= 1.0 and not tr.partial_closed:
+                half_vol = round(p.volume / 2, 2) if hasattr(p, 'volume') else 0.01
+                if half_vol >= 0.01:
+                    logger.info(f"BE+partial {tid}: {r:.2f}R — close {half_vol}, SL->BE")
+                    if not dry_run:
+                        self.interface.close_partial_position(tid, half_vol)
+                        self.interface.modify_position(tid, tr.entry_price, tr.tp)
+                    tr.partial_closed = True; continue
+
+            # --- Chandelier Trail at +1.2R ---
+            if r >= 1.2 and atr_val > 0:
+                if tr.side > 0:
+                    ns = close_val - atr_val * 1.0
+                    if ns > tr.sl:
+                        if not dry_run: self.interface.modify_position(tid, ns, tr.tp)
+                        tr.sl = ns
+                else:
+                    ns = close_val + atr_val * 1.0
+                    if ns < tr.sl:
+                        if not dry_run: self.interface.modify_position(tid, ns, tr.tp)
+                        tr.sl = ns
+
+            # --- Confidence Decay ---
+            try:
+                feat = self._compute_live_features(df)
+                model = self.long_model if tr.side > 0 else self.short_model
+                if feat and model:
+                    for zk in ["atr_norm", "kyle_lambda", "vprof_poc_dist", "ofi_window", "tick_imbalance"]:
+                        feat[zk] = self._zscore(zk, feat.get(zk, 0.0), win=model.zscore_window)
+                    f_list = [feat.get(f, 0.0) for f in model.features]
+                    X = np.array(f_list, dtype=np.float32)
+                    _, p_cal = model.predict_calibrated(X)
+                    if p_cal < 0.40:
+                        logger.info(f"Conf decay {tid}: p_cal={p_cal:.3f} — early close at {r:.2f}R")
+                        if not dry_run: self.interface.close_position(tid)
+                        self._add_reentry_cooldown(tr.side)
+                        self._trackers.pop(tid, None); continue
+            except Exception:
+                pass
+
+        # ---- Hedge-aware exits (both sides active) ----
+        longs = [t for t in self._trackers.values() if t.side > 0]
+        shorts = [t for t in self._trackers.values() if t.side < 0]
+        if longs and shorts:
+            lr = longs[0].highest_r; sr = shorts[0].highest_r
+
+            if lr > 0.6 and sr > 0.6:
+                logger.info(f"Hedge: both >0.6R (L={lr:.2f} S={sr:.2f}) — closing both")
+                if not dry_run:
+                    for t in longs + shorts: self.interface.close_position(t.ticket)
+                self._trackers.clear(); return
+
+            if lr + sr >= 2.0:
+                logger.info(f"Hedge: net {lr+sr:.2f} >= 2.0 — closing both")
+                if not dry_run:
+                    for t in longs + shorts: self.interface.close_position(t.ticket)
+                self._trackers.clear(); return
+
+            stronger = max(longs + shorts, key=lambda t: t.highest_r)
+            weaker = min(longs + shorts, key=lambda t: t.highest_r)
+            if stronger.highest_r > 1.2 and weaker.highest_r > 0.4:
+                hv = round(self._get_volume(stronger.ticket) / 2, 2)
+                logger.info(f"Hedge asym: close weak {weaker.ticket}({weaker.highest_r:.2f}R)"
+                            f" + partial strong {stronger.ticket}({stronger.highest_r:.2f}R)")
+                if not dry_run:
+                    self.interface.close_position(weaker.ticket)
+                    if hv >= 0.01: self.interface.close_partial_position(stronger.ticket, hv)
+                self._trackers.pop(weaker.ticket, None); return
+
+            if lr < -0.8 and sr < -0.8:
+                worse = min(longs + shorts, key=lambda t: t.highest_r)
+                logger.info(f"Hedge lock: close worse {worse.ticket}({worse.highest_r:.2f}R)")
+                if not dry_run: self.interface.close_position(worse.ticket)
+                self._trackers.pop(worse.ticket, None); return
+
     def run(self, interval_s: int = 10, dry_run: bool = False):
         logger.info(f"Event-based live loop ({interval_s}s, dry_run={dry_run})")
         if not self.interface.initialize():
@@ -265,19 +447,7 @@ class LiveEnsembleTrader:
                 last_update = now
                 self.bar_counter += 1
 
-                # Check positions per-side (hedging allowed)
-                positions = self.interface.get_positions() or []
-                has_long = any(p.type == 0 for p in positions)
-                has_short = any(p.type == 1 for p in positions)
-                if has_long and has_short:
-                    continue  # both sides active, no new entries
-                if self.bar_counter % 12 == 0 and len(positions) > 0:
-                    logger.info(f"Positions open — long={has_long} short={has_short}, new entries blocked per-side")
-
-                if not self.risk_mgr.can_trade():
-                    time.sleep(10); continue
-
-                # Fetch data
+                # Fetch data for exit management + signal scanning
                 rates = self.interface.get_rates(count=700)
                 if rates is None or len(rates) < 60:
                     continue
@@ -286,15 +456,56 @@ class LiveEnsembleTrader:
                 if len(df) < 60:
                     continue
 
+                # ---- Phase 1: Manage open positions ----
+                positions = self.interface.get_positions() or []
+                if positions:
+                    self._manage_positions(positions, df, dry_run)
+                    # Re-fetch positions after management actions
+                    positions = self.interface.get_positions() or []
+
+                # ---- Phase 2: Macro exits (news) ----
+                if NewsManager.is_in_blackout():
+                    if positions:
+                        logger.info("News blackout — closing positions")
+                        if not dry_run: self.interface.close_all_positions()
+                        self._trackers.clear()
+                        positions = []
+                    else:
+                        logger.info("News blackout — skipping entries")
+                    continue  # skip entry scan during blackout
+
+                # ---- Phase 3: Cooldown cleanup ----
+                self._reentry_cooldowns = [(b, s) for b, s in self._reentry_cooldowns
+                                           if self.bar_counter - b < 10]
+
+                # ---- Phase 4: Check for new entries ----
+                if not self.risk_mgr.can_trade():
+                    time.sleep(10); continue
+
+                has_long = any(p.type == 0 for p in positions)
+                has_short = any(p.type == 1 for p in positions)
+                if has_long and has_short:
+                    continue  # both active, no new entries
+
                 atr = df["ATR"].iloc[-1]
                 current_price = df["close"].iloc[-1]
 
-                # Always compute features and predict every 10s for visibility
                 for model, side in [(self.long_model, 1), (self.short_model, -1)]:
                     if model is None:
                         continue
 
+                    # Cooldowns
+                    if self.bar_counter - self._flip_cooldown_bar < 3:
+                        continue
+                    has_side = has_long if side > 0 else has_short
+                    if has_side:
+                        continue
+                    if any(self.bar_counter - b < 10 for b, s in self._reentry_cooldowns if s == side):
+                        continue
+
                     feat = self._compute_live_features(df)
+                    if feat is None:
+                        continue
                     if feat is None:
                         continue
 
@@ -316,8 +527,19 @@ class LiveEnsembleTrader:
                         logger.info(f"Skip {side_label}: cal={p_cal:.3f} < {model.threshold:.2f}")
                         continue
 
-                    # Per-side position gate (predictions still log, but orders blocked)
-                    if (side > 0 and has_long) or (side < 0 and has_short):
+                    # Directional flip: high-confidence signal opposite existing position
+                    opp_has = has_short if side > 0 else has_long
+                    if opp_has:
+                        flip_tickets = [p.ticket for p in positions if (p.type == 1) == (side > 0)]
+                        logger.info(f"DIRECTIONAL FLIP: {side_label} p_cal={p_cal:.3f} — "
+                                    f"closing {len(flip_tickets)} opposing positions")
+                        if not dry_run:
+                            for ft in flip_tickets:
+                                self.interface.close_position(ft)
+                                self._trackers.pop(ft, None)
+                        self._flip_cooldown_bar = self.bar_counter
+                        time.sleep(1)
+                    elif (side > 0 and has_long) or (side < 0 and has_short):
                         logger.info(f"Block {side_label}: position already open")
                         continue
 
