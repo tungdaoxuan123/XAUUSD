@@ -1,6 +1,6 @@
 import pytest
-from core.voting import VotingEngine
-from strategies.base import Vote
+from v3_trade.core.voting import VotingEngine
+from v3_trade.strategies.base import Vote
 
 def test_voting_aggregation():
     engine = VotingEngine()

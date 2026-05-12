@@ -1,4 +1,4 @@
-from config.settings import RISK_PERCENT_PER_TRADE, MAX_RISK_PERCENT
+from v3_trade.config.settings import RISK_PERCENT_PER_TRADE, MAX_RISK_PERCENT
 
 class RiskManager:
     def __init__(self, pip_value_per_lot=100.0): # Approximate for XAUUSD depending on broker

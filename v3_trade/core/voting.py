@@ -1,5 +1,5 @@
 from typing import List
-from strategies.base import Vote
+from v3_trade.strategies.base import Vote
 import logging
 
 class VotingEngine:
@@ -13,7 +13,7 @@ class VotingEngine:
             "EXHAUSTION_SHORT": {"BULL_TREND": 1.5, "BEAR_TREND": 2.0, "RANGING": 0.5, "VOLATILE": 1.5, "UNKNOWN": 1.0},
             "VWAP_REVERSION": {"BULL_TREND": 2.0, "BEAR_TREND": 0.0, "RANGING": 1.2, "VOLATILE": 1.0, "UNKNOWN": 1.0}
         }
-        from config.settings import THRESHOLDS
+        from v3_trade.config.settings import THRESHOLDS
         self.thresholds = THRESHOLDS
 
     def get_max_score(self, current_regime: str) -> float:
@@ -37,7 +37,7 @@ class VotingEngine:
                 
         return long_score, short_score
         
-    def evaluate_threshold(self, long_score, short_score, current_regime, m1_last):
+    def get_current_threshold(self, current_regime: str, m1_last) -> float:
         threshold = self.thresholds.get("NORMAL_VOLATILITY", 3.0)
         
         if current_regime == "VOLATILE":
@@ -49,6 +49,11 @@ class VotingEngine:
                 threshold = self.thresholds.get("LOW_VOLATILITY", 2.5)
             elif ratio > 0.008:
                 threshold = self.thresholds.get("HIGH_VOLATILITY", 4.0)
+                
+        return threshold
+        
+    def evaluate_threshold(self, long_score, short_score, current_regime, m1_last):
+        threshold = self.get_current_threshold(current_regime, m1_last)
 
         decision = "FLAT"
         final_score = 0.0

@@ -1,5 +1,5 @@
 import pytest
-from core.risk import RiskManager
+from v3_trade.core.risk import RiskManager
 
 def test_position_size():
     risk = RiskManager(pip_value_per_lot=100.0)

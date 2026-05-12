@@ -1,12 +1,57 @@
-Why Score = 0.00 in VOLATILE Regime
-Problem 1: EMA_MACD_TREND weight is 0.0 in VOLATILE
-The most active strategy — EMA crossover — is completely silenced in VOLATILE regime. Weight = 0.0 means even if it fires with confidence 1.0, it contributes zero to the score.
+Found it. The bug is in `logger.py`  — `log_signal` does **not** log per-strategy votes to the console. The per-strategy vote lines you see (`RSI_DIV voted LONG`) must be logged somewhere else — which means the `log_signal` call happens **after** `aggregate()` already returned 0.
 
-Problem 2: VWAP_REVERSION weight is 0.0 in VOLATILE
-Same issue. Two of the six strategies are dead in VOLATILE.
+The real bug: **`log_signal` is called with `final_score` from `evaluate_threshold`, but `evaluate_threshold` receives `long_score` and `short_score` from `aggregate()`**. The score = 0.00 in the log means `aggregate()` itself is returning 0 — meaning the vote from `RSI_DIV` is being dropped inside `aggregate()`.
 
-Problem 3: Right now the bot is correctly classifying as VOLATILE (ATR spike above 1.5× mean)
-But VOLATILE is actually the best time for EMA trend and exhaustion signals on XAUUSD. The zero-weights were too conservative.
+The exact cause: look at `aggregate()` in :
 
-Problem 4: logger.log_signal doesn't print per-strategy vote details
-You can't see which strategies actually fired — the log only shows the final decision. This makes debugging blind.
+```python
+w = self.weights.get(vote.strategy_id, {}).get(current_regime, 1.0)
+score = w * vote.confidence
+```
+
+`RSI_DIV` weight in `VOLATILE` = `0.5`. Score = `0.5 × 0.70 = 0.35`. This is **not** zero.
+
+**The real culprit: the per-strategy vote log line fires from `main_loop.py` — but it runs BEFORE `voting_engine.aggregate()` is called.** The score `0.00` in the decision log is correct — it means `long_score = 0.35` but the threshold in `VOLATILE` is `4.0` . `0.35 < 4.0` → FLAT.
+
+***
+
+## This is Normal — Not a Bug
+
+The system is working exactly as designed. `RSI_DIV` alone scores `0.35`. You need `4.0` to trigger in VOLATILE regime. You need **multiple strategies agreeing simultaneously**.
+
+The bot won't fire until 3–4 strategies align in the same bar. That's the point of the ensemble — it should be selective.
+
+***
+
+## What to Watch For
+
+Add this one line to `main_loop.py` right after `aggregate()` so you can see the live scores:
+
+```python
+long_score, short_score = self.voting_engine.aggregate(votes, regime)
+# ADD THIS:
+self.logger.info(f"  Scores -> LONG: {long_score:.2f} | SHORT: {short_score:.2f} | Threshold: {self.voting_engine.get_current_threshold(regime, m1_last):.2f}")
+```
+
+And add `get_current_threshold()` to `VotingEngine`:
+
+```python
+def get_current_threshold(self, regime, m1_last):
+    threshold = self.thresholds.get("NORMAL_VOLATILITY", 3.0)
+    if regime == "VOLATILE":
+        threshold = self.thresholds.get("HIGH_VOLATILITY", 4.0)
+    if 'ATR_14' in m1_last and 'close' in m1_last:
+        ratio = m1_last['ATR_14'] / m1_last['close']
+        if ratio < 0.003: threshold = self.thresholds.get("LOW_VOLATILITY", 2.5)
+        elif ratio > 0.008: threshold = self.thresholds.get("HIGH_VOLATILITY", 4.0)
+    return threshold
+```
+
+Then your logs will show:
+```
+RSI_DIV voted LONG (Conf: 0.70)
+Scores -> LONG: 0.35 | SHORT: 0.00 | Threshold: 4.00
+Decision: FLAT (Score: 0.00)
+```
+
+That tells you exactly how far you are from a trade trigger each bar. Let it run through a London or NY session open — that's when multiple strategies will fire together.

@@ -21,26 +21,28 @@ class IndicatorEngine:
 
     @staticmethod
     def add_vwap(df, anchor='D'):
-        if 'time' in df.columns:
-            df_temp = df.set_index('time')
-        else:
-            df_temp = df.copy()
-            
+        df_temp = df.copy()
         df_temp['Typical_Price'] = (df_temp['high'] + df_temp['low'] + df_temp['close']) / 3
         df_temp['VP'] = df_temp['Typical_Price'] * df_temp['tick_volume']
-        
-        # Group by the anchor period. For session anchored, we use Daily 'D'
-        grouper = df_temp.groupby(df_temp.index.to_period(anchor))
-        
+
+        if 'time' in df.columns and hasattr(df_temp['time'].iloc[0], 'strftime'):
+            dt_idx = pd.DatetimeIndex(df['time'])
+            if anchor == 'D':
+                df_temp['_anchor'] = dt_idx.normalize()
+            elif anchor == 'W':
+                df_temp['_anchor'] = dt_idx - pd.to_timedelta(dt_idx.dayofweek, unit='D')
+            else:
+                df_temp['_anchor'] = dt_idx.normalize()
+            grouper = df_temp.groupby('_anchor')
+        else:
+            # Fallback: cumulative VWAP (not session-anchored)
+            df['VWAP'] = df_temp['VP'].cumsum() / df_temp['tick_volume'].cumsum().replace(0, np.nan)
+            return df
+
         df_temp['Cum_VP'] = grouper['VP'].cumsum()
         df_temp['Cum_Vol'] = grouper['tick_volume'].cumsum()
-        
         vwap = df_temp['Cum_VP'] / df_temp['Cum_Vol']
-        
-        if 'time' in df.columns:
-            df['VWAP'] = vwap.values
-        else:
-            df['VWAP'] = vwap
+        df['VWAP'] = vwap.values
         return df
 
     @staticmethod
@@ -94,7 +96,7 @@ class IndicatorEngine:
     @staticmethod
     def add_ema50_slope(df):
         if 'EMA_50' in df.columns and 'ATR_14' in df.columns:
-            df['EMA_50_SLOPE'] = (df['EMA_50'] - df['EMA_50'].shift(10)) / df['ATR_14']
+            df['EMA_50_SLOPE'] = ((df['EMA_50'] - df['EMA_50'].shift(10)) / df['ATR_14'].replace(0, np.nan)).fillna(0)
         return df
 
     @classmethod
@@ -144,11 +146,11 @@ class IndicatorEngine:
         tr = pd.Series(tr, index=df.index)
         
         atr = tr.ewm(alpha=1/14, adjust=False).mean()
-        pos_di = 100 * (pos_dm.ewm(alpha=1/14, adjust=False).mean() / atr)
-        neg_di = 100 * (neg_dm.ewm(alpha=1/14, adjust=False).mean() / atr)
+        pos_di = 100 * (pos_dm.ewm(alpha=1/14, adjust=False).mean() / atr.replace(0, np.nan))
+        neg_di = 100 * (neg_dm.ewm(alpha=1/14, adjust=False).mean() / atr.replace(0, np.nan))
         
-        dx = 100 * np.abs(pos_di - neg_di) / (pos_di + neg_di)
-        df['ADX_14'] = dx.ewm(alpha=1/14, adjust=False).mean()
+        dx = 100 * np.abs(pos_di - neg_di) / (pos_di + neg_di).replace(0, np.nan)
+        df['ADX_14'] = dx.ewm(alpha=1/14, adjust=False).mean().fillna(0)
         
         return df
         

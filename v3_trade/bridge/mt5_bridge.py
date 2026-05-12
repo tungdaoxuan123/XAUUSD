@@ -65,7 +65,7 @@ class MT5Bridge:
             "magic": self.magic_number,
             "comment": comment,
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": mt5.ORDER_FILLING_RETURN,
         }
         
         result = mt5.order_send(request)

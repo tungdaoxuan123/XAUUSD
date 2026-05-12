@@ -1,21 +1,21 @@
 import time
 import MetaTrader5 as mt5
-from bridge.mt5_bridge import MT5Bridge
-from bridge.data_assembler import DataAssembler
-from indicators.engine import IndicatorEngine
-from indicators.regime import RegimeDetector
-from strategies.ema_macd import EMAMACDTrend
-from strategies.bb_squeeze import BBSqueezeBreakout
-from strategies.ict_ob import ICTOrderBlock
-from strategies.rsi_div import RSIDivergence
-from strategies.exhaustion import ExhaustionShort
-from strategies.vwap_reversion import VWAPMeanReversion
-from core.voting import VotingEngine, ml_gate
-from core.risk import RiskManager
-from core.position_monitor import PositionMonitor
-from core.logger import TradeLogger
-from config.settings import SYMBOL
-from utils.session import SessionManager
+from v3_trade.bridge.mt5_bridge import MT5Bridge
+from v3_trade.bridge.data_assembler import DataAssembler
+from v3_trade.indicators.engine import IndicatorEngine
+from v3_trade.indicators.regime import RegimeDetector
+from v3_trade.strategies.ema_macd import EMAMACDTrend
+from v3_trade.strategies.bb_squeeze import BBSqueezeBreakout
+from v3_trade.strategies.ict_ob import ICTOrderBlock
+from v3_trade.strategies.rsi_div import RSIDivergence
+from v3_trade.strategies.exhaustion import ExhaustionShort
+from v3_trade.strategies.vwap_reversion import VWAPMeanReversion
+from v3_trade.core.voting import VotingEngine, ml_gate
+from v3_trade.core.risk import RiskManager
+from v3_trade.core.position_monitor import PositionMonitor
+from v3_trade.core.logger import TradeLogger
+from v3_trade.config.settings import SYMBOL
+from v3_trade.utils.session import SessionManager
 
 class BotOrchestrator:
     def __init__(self):
@@ -43,14 +43,12 @@ class BotOrchestrator:
             
         self.logger.info("v3_trade Bot Started.")
         last_fetched_timestamp = None
+        data_dict = None
         
         try:
             while True:
                 # 1. Bar-Close Timing Guard
                 is_new_bar, expected_close = self.assembler.check_new_bar(last_fetched_timestamp)
-                
-                # Also run position monitor (trailing stops) frequently
-                self.position_monitor.manage_open_positions(None)
                 
                 if not is_new_bar:
                     time.sleep(1)
@@ -66,8 +64,14 @@ class BotOrchestrator:
                     self.logger.error("Failed to fetch data.")
                     time.sleep(5)
                     continue
-                    
-                # 3. Indicators
+
+                # 3. Manage open positions (trailing stops) with fresh data
+                if 'M1' in data_dict:
+                    self.position_monitor.manage_open_positions(data_dict['M1'].iloc[-1])
+                else:
+                    self.position_monitor.manage_open_positions(None)
+
+                # 4. Indicators
                 data_dict = IndicatorEngine.compute_all(data_dict)
                 
                 # 4. Regime Detection
@@ -83,6 +87,8 @@ class BotOrchestrator:
                 # 6. Vote Aggregation
                 m1_last = data_dict['M1'].iloc[-1]
                 long_score, short_score = self.voting_engine.aggregate(votes, regime)
+                
+                self.logger.info(f"  Scores -> LONG: {long_score:.2f} | SHORT: {short_score:.2f} | Threshold: {self.voting_engine.get_current_threshold(regime, m1_last):.2f}")
                 
                 decision, final_score = self.voting_engine.evaluate_threshold(long_score, short_score, regime, m1_last)
                 

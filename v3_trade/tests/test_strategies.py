@@ -1,9 +1,9 @@
 import pytest
 import pandas as pd
 import numpy as np
-from strategies.base import Vote
-from strategies.ema_macd import EMAMACDTrend
-from strategies.vwap_reversion import VWAPMeanReversion
+from v3_trade.strategies.base import Vote
+from v3_trade.strategies.ema_macd import EMAMACDTrend
+from v3_trade.strategies.vwap_reversion import VWAPMeanReversion
 
 def create_mock_m1():
     df = pd.DataFrame({'close': np.random.randn(100), 'open': np.random.randn(100)})
